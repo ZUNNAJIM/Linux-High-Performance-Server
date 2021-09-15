@@ -4449,3 +4449,77 @@ xinetd采用 /etc/xinetd.conf 主配置文件和/etc/xinetd.d 目录下的子配
 
 #### 1.1 发送信号
 
+Linux 下，一个进程给其他进程发送信号的 API是 kill 函数。其定义如下∶
+
+```cpp
+#include <sys/types.h>
+#include <signal.h>
+int kill(pid_t pid. int sig);
+```
+
+该函数把信号 sig 发送给目标进程;目标进程由 pid参数指定，其可能的取值及含义如表所示:
+
+<div align="center" style="font-weight:900;font-size:larger">kill函数的pid参数及其含义 </div>
+
+<div align="center">
+	<table align="center">
+		<tr style="font-size:large;font-weight:700">
+			<td>pid参数</td>
+			<td>含义</td>
+		</tr>
+		<tr>
+			<td>pid > 0 </td>
+			<td> 信号发送给PID为pid的进程 </td
+		</tr>
+		<tr>
+			<td>pid = 0</td>
+			<td>信号发送给本进程组的其他进程</td>
+		</tr>
+		<tr>
+			<td>pid = -1</td>
+			<td>信号发送给init进程之外的所有进程，但发送者需要拥有权限</td>
+		</tr>
+		<tr>
+			<td>pid < -1 </td>
+			<td>信号发送给组ID 为-pid的进程组中的所有成员</td>
+		</tr>
+	</table>
+</div>
+
+
+Linux 定义的信号值都大于 0，如果 sig取值为 0，则 kill 函数不发送任何信号。
+
+该函数成功时返回 0，失败则返回 -1 并设置 errno。几种可能的 errno 如表所示:
+
+<div align="center" style="font-weight:900;font-size:larger">kill函数出错的情况</div>
+
+<div align="center">
+	<table align="center">
+		<tr style="font-size:large;font-weight:700">
+			<td>errno</td>
+			<td>含义</td>
+		</tr>
+		<tr>
+			<td>EINVAL</td>
+			<td>无效的信号</td>
+		</tr>
+		<tr>
+			<td>EPERM</td>
+			<td>该进程没有给另外的进程发送信号的权限</td>
+		</tr>
+		<tr>
+			<td>ESRCH</td>
+			<td>目标进程或进程组不存在</td>
+		</tr>
+	</table>
+</div>
+
+
+#### 1.2 信号处理方式
+
+目标进程在收到信号时，需要定义一个接收函数来处理之。信号处理函数的原型如下：
+```cpp
+#include <signal.h>
+typedef void (*__sighandler_t)(int);
+```
+
