@@ -5044,4 +5044,1128 @@ int main( int argc, char* argv[] )
 - SIGALRM信号。
 - I/O复用系统调用的超时参数。
 
+### 1. socket选项SO_RCVTIMEO和SO_SNDTIMEO
+第5章中我们介绍过socket选项SO_RCVTIMEO和SO_SNDTIMEO，它们分别用来设置socket接收数据超时时间和发送数据超时时间。因此，这两个选项仅对与数据接收和发送相关的 socket专用系统调用有效，这些系统调用包括send、sendmsg、recv、recvmsg、accept 和 connect。我们将选项So_RCVTIMEO和SO_SNDTIMEO对这些系统调用的影响总结于下表中。
 
+
+<div align="center" style="font-weight:900;font-size:larger">SO_RCVTIMEO和SO_SNDTIMEO选项的作用</div>
+
+<div align="center">
+	<table align="center">
+		<tr style"font-size:large;font-weight:700">
+			<td>系统调用</td>
+			<td>有效选项</td>
+			<td>系统调用超时后的行为</td>
+		</tr>
+		<tr>
+			<td>send</td>
+			<td>SO_SNDTIMEO</td>
+			<td>返回-1，设置errno为EAGAIN或EWOULDBLOCK</td>
+		</tr>
+		<tr>
+			<td>sendmsg</td>
+			<td>SO_SNDTIMEO</td>
+			<td>返回-1，设置errno为EAGAIN或EWOULDBLOCK</td>
+		</tr>
+		<tr>
+			<td>recv</td>
+			<td>SO_RCVTIMEO</td>
+			<td>返回-1，设置errno为EAGAIN或EWOULDBLOCK</td>
+		</tr>
+		<tr>
+			<td>recvmsg</td>
+			<td>SO_RCVTIMEO</td>
+			<td>返回-1，设置errno为EAGAIN或EWOULDBLOCK</td>
+		</tr>
+		<tr>
+			<td>accept</td>
+			<td>SO_RCVTIMEO</td>
+			<td>返回-1，设置errno为EAGAIN或EWOULDBLOCK</td>
+		</tr>
+		<tr>
+			<td>connect</td>
+			<td>SO_SNDTIMEO</td>
+			<td>返回-1，设置errno为EINPROGRESS</td>
+		</tr>
+	</table>
+</div>
+
+
+
+在程序中，我们可以根据系统调用（send、sendmsg、recv、recvmsg、accept 和 connect）的返回值以及 errno 来判断超时时间是否已到，进而决定是否开始处理定时任务。
+
+```cpp
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+
+/* 设置超时连接函数 */
+int timeout_connect( const char* ip, int port, int time )
+{
+    int ret = 0;
+    struct sockaddr_in address;
+    bzero( &address, sizeof( address ) );
+    address.sin_family = AF_INET;
+    inet_pton( AF_INET, ip, &address.sin_addr );
+    address.sin_port = htons( port );
+
+    int sockfd = socket( PF_INET, SOCK_STREAM, 0 );
+    assert( sockfd >= 0 );
+
+	/* 通过选项 so RCVTIMEO 和 sO SNDTIMEO 所设置的超时时间的类型是timeval，这和select系统调用的超时参数类型相同*/
+    struct timeval timeout;
+    timeout.tv_sec = time;
+    timeout.tv_usec = 0;
+    socklen_t len = sizeof( timeout );
+    ret = setsockopt( sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, len );
+    assert( ret != -1 );
+
+    ret = connect( sockfd, ( struct sockaddr* )&address, sizeof( address ) );
+    if ( ret == -1 )
+    {
+        if( errno == EINPROGRESS )
+        {
+            printf( "connecting timeout\n" );
+            return -1;
+        }
+        printf( "error occur when connecting to server\n" );
+        return -1;
+    }
+
+    return sockfd;
+}
+
+int main( int argc, char* argv[] )
+{
+    if( argc <= 2 )
+    {
+        printf( "usage: %s ip_address port_number\n", basename( argv[0] ) );
+        return 1;
+    }
+    const char* ip = argv[1];
+    int port = atoi( argv[2] );
+
+    int sockfd = timeout_connect( ip, port, 10 );
+    if ( sockfd < 0 )
+    {
+        return 1;
+    }
+    return 0;
+}
+```
+
+
+### 2. SIGALRM信号
+
+由alarm和 setitimer函数设置的实时闹钟一旦超时，将触发SIGALRM信号。因此，我们可以利用该信号的信号处理函数来处理定时任务。但是，如果要处理多个定时任务，我们就需要不断地触发SIGALRM信号，并在其信号处理函数中执行到期的任务。一般而言，SIGALRM信号按照固定的频率生成，即由alarm或setitimer 函数设置的定时周期T保持不变。如果某个定时任务的超时时间不是T的整数倍，那么它实际被执行的时间和预期的时间将略有偏差。因此定时周期T反映了定时的精度。
+
+#### 2.1 基于升序链表的定时器
+定时器通常至少要包含两个成员:一个超时时间（相对时间或者绝对时间）和一个任务回调函数。有的时候还可能包含回调函数被执行时需要传入的参数，以及是否重启定时器等信息。如果使用链表作为容器来串联所有的定时器，则每个定时器还要包含指向下一个定时器的指针成员。进一步，如果链表是双向的，则每个定时器还需要包含指向前一个定时器的指针成员。
+
+
+<div align="center" style="font-weight:900;font-size:larger">升序定时器链表</div>
+
+```cpp
+
+#ifndef LST_TIMER
+#define LST_TIMER
+
+#include <time.h>
+
+#define BUFFER_SIZE 64
+
+class util_timer;	/* 前向声明 */
+
+/* 用户数据结构：socket地址，socket文件描述符，读缓存，定时器 */
+struct client_data
+{
+    sockaddr_in address;
+    int sockfd;
+    char buf[ BUFFER_SIZE ];
+    util_timer* timer;
+};
+
+/* 定时器类 */
+class util_timer
+{
+public:
+    util_timer() : prev( NULL ), next( NULL ){}		/* constructor */
+
+public:
+   time_t expire;							/* 任务的超时时间 */
+   void (*cb_func)( client_data* );			/* 回调函数 */
+   client_data* user_data;					/* 回调函数处理的客户数据，由定时器执行者传递给回调函数 */
+   util_timer* prev;						/* 指向前一个计时器 */
+   util_timer* next;						/* 指向后一个计时器 */
+};
+
+/* 定时器链表 */
+class sort_timer_lst
+{
+public:
+    sort_timer_lst() : head( NULL ), tail( NULL ) {}	/* constructor */
+    ~sort_timer_lst()									/* destructor */
+    {
+        util_timer* tmp = head;
+        while( tmp )
+        {
+            head = tmp->next;
+            delete tmp;
+            tmp = head;
+        }
+    }
+    void add_timer( util_timer* timer )					/* add a timer */
+    {
+        if( !timer )
+        {
+            return;
+        }
+        if( !head )
+        {
+            head = tail = timer;
+            return; 
+        }
+		/* 如果目标定时器的超时时间小于当前链表中所有定时器的超时时间，则把诚定时器插入链表头部， 作为链表新的头节点。否则就需要调用重载函数 add_timer(util_timer*timer，util_timer* lst_head)， 把它插入链表中合适的位置，以保证链表的升序特性 */
+        if( timer->expire < head->expire )
+        {
+            timer->next = head;
+            head->prev = timer;
+            head = timer;
+            return;
+        }
+		/* 重载函数 */
+        add_timer( timer, head );
+    }
+	/* 当某个定时任务发生变化时，调整对应的定时器在链表中的位置。这个函数只考虑被调整的定时器
+的超时时间延长的情况，即该定时器需要往链表的尾部移动 */
+    void adjust_timer( util_timer* timer )
+    {
+        if( !timer )
+        {
+            return;
+        }
+        util_timer* tmp = timer->next;
+        if( !tmp || ( timer->expire < tmp->expire ) )
+        {
+            return;
+        }
+		/* 如果被调整的目标定时器处在链表尾部，或者该定时器新的超时值仍然小于其下一个定时器的 超时值，则不用调整*/
+        if( timer == head )
+        {
+            head = head->next;
+            head->prev = NULL;
+            timer->next = NULL;
+            add_timer( timer, head );
+        }
+		/* 如果目标定时器不是链表的头节点，则将该定时器从链表中取出，然后插入其原来所在位置之 后的部分链表中*/
+        else
+        {
+            timer->prev->next = timer->next;
+            timer->next->prev = timer->prev;
+            add_timer( timer, timer->next );
+        }
+    }
+
+	/* 将目标定时器 timer 从链表中删险 */
+    void del_timer( util_timer* timer )
+    {
+        if( !timer )
+        {
+            return;
+        }
+        if( ( timer == head ) && ( timer == tail ) )
+        {
+            delete timer;
+            head = NULL;
+            tail = NULL;
+            return;
+        }
+        if( timer == head )
+        {
+            head = head->next;
+            head->prev = NULL;
+            delete timer;
+            return;
+        }
+        if( timer == tail )
+        {
+            tail = tail->prev;
+            tail->next = NULL;
+            delete timer;
+            return;
+        }
+        timer->prev->next = timer->next;
+        timer->next->prev = timer->prev;
+        delete timer;
+    }
+	/* SIGALRM信号每次被触发就在其信号处理函数（如果使用统一事件源，则是主函数）中执行一次
+tick 函数，以处理链表上到期的任务 */
+    void tick()
+    {
+        if( !head )
+        {
+            return;
+        }
+        printf( "timer tick\n" );
+        time_t cur = time( NULL );		/* current system time */
+        util_timer* tmp = head;
+		/* 从头结点开始依次处理每个定时器，直到遇到一个尚未到期的定时器，这就是定时器的核心逻辑 */
+        while( tmp )
+        {
+			/* 因为每个定时器都使用绝对时间作为超时值，所以我们可以把定时器的超时值和系统当 前时间比较以判断定时器是否到期 */
+            if( cur < tmp->expire )
+            {
+                break;
+            }
+            tmp->cb_func( tmp->user_data );
+            head = tmp->next;
+            if( head )
+            {
+                head->prev = NULL;
+            }
+            delete tmp;
+            tmp = head;
+        }
+    }
+
+private:
+	/* 重载函数 */
+    void add_timer( util_timer* timer, util_timer* lst_head )
+    {
+        util_timer* prev = lst_head;
+        util_timer* tmp = prev->next;
+        while( tmp )
+        {
+            if( timer->expire < tmp->expire )
+            {
+                prev->next = timer;
+                timer->next = tmp;
+                tmp->prev = timer;
+                timer->prev = prev;
+                break;
+            }
+            prev = tmp;
+            tmp = tmp->next;
+        }
+        if( !tmp )
+        {
+            prev->next = timer;
+            timer->prev = prev;
+            timer->next = NULL;
+            tail = timer;
+        }
+        
+    }
+
+private:
+    util_timer* head;
+    util_timer* tail;
+};
+
+#endif
+```
+sort_timer_lst是一个升序链表。其核心函数tick相当于一个心搏函数，它每隔一段固定的时间就执行一次，以检测并处理到期的任务。判断定时任务到期的依据是定时器的expire值小于当前的系统时间。从执行效率来看，添加定时器的时间复杂度是O(n)，删除定时器的时间复杂度是O(1)，执行定时任务的时间复杂度是O(1)。
+
+#### 2.2 处理非活动连接
+
+现在我们考虑上述升序定时器链表的实际应用——处理非活动连接。服务器程序通常要定期处理非活动连接:给客户端发一个重连请求，或者关闭该连接，或者其他。Linux在内核中提供了对连接是否处于活动状态的定期检查机制，我们可以通过socket选项KEEPALIVE来激活它。不过使用这种方式将使得应用程序对连接的管理变得复杂。因此,我们可以考虑在应用层实现类似于KEEPALIVE的机制，以管理所有长时间处于非活动状态的连接。比如，以下代码利用alarm函数周期性地触发SIGALRM信号，该信号的信号处理函数利用管道通知主循环执行定时器链表上的定时任务——关闭非活动的连接。
+
+
+<div align="center" style="font-weight:900;font-size:larger">关闭非活动连接</div>
+
+```cpp
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <pthread.h>
+#include "lst_timer.h"
+
+#define FD_LIMIT 65535
+#define MAX_EVENT_NUMBER 1024
+#define TIMESLOT 5
+
+static int pipefd[2];
+static sort_timer_lst timer_lst;
+static int epollfd = 0;
+
+int setnonblocking( int fd )
+{
+    int old_option = fcntl( fd, F_GETFL );
+    int new_option = old_option | O_NONBLOCK;
+    fcntl( fd, F_SETFL, new_option );
+    return old_option;
+}
+
+void addfd( int epollfd, int fd )
+{
+    epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET;
+    epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
+    setnonblocking( fd );
+}
+
+void sig_handler( int sig )
+{
+    int save_errno = errno;
+    int msg = sig;
+    send( pipefd[1], ( char* )&msg, 1, 0 );
+    errno = save_errno;
+}
+
+void addsig( int sig )
+{
+    struct sigaction sa;
+    memset( &sa, '\0', sizeof( sa ) );
+    sa.sa_handler = sig_handler;
+    sa.sa_flags |= SA_RESTART;
+    sigfillset( &sa.sa_mask );
+    assert( sigaction( sig, &sa, NULL ) != -1 );
+}
+
+void timer_handler()
+{
+	/* 定时处理任务，实际上就是调用 tick 函数 */
+    timer_lst.tick();
+	/* 因为一次 alarm调用只会引起一次SIGALRM信号，所以我们要重新定时，以不断触发SIGALRM 信号*/
+    alarm( TIMESLOT );
+}
+
+/* 定时器回调函数，它删除非活动连接 socket 上的注册事件，并关闭之 */
+void cb_func( client_data* user_data )
+{
+    epoll_ctl( epollfd, EPOLL_CTL_DEL, user_data->sockfd, 0 );
+    assert( user_data );
+    close( user_data->sockfd );
+    printf( "close fd %d\n", user_data->sockfd );
+}
+
+int main( int argc, char* argv[] )
+{
+    if( argc <= 2 )
+    {
+        printf( "usage: %s ip_address port_number\n", basename( argv[0] ) );
+        return 1;
+    }
+    const char* ip = argv[1];
+    int port = atoi( argv[2] );
+
+    int ret = 0;
+    struct sockaddr_in address;
+    bzero( &address, sizeof( address ) );
+    address.sin_family = AF_INET;
+    inet_pton( AF_INET, ip, &address.sin_addr );
+    address.sin_port = htons( port );
+
+    int listenfd = socket( PF_INET, SOCK_STREAM, 0 );
+    assert( listenfd >= 0 );
+
+    ret = bind( listenfd, ( struct sockaddr* )&address, sizeof( address ) );
+    assert( ret != -1 );
+
+    ret = listen( listenfd, 5 );
+    assert( ret != -1 );
+
+    epoll_event events[ MAX_EVENT_NUMBER ];
+    int epollfd = epoll_create( 5 );
+    assert( epollfd != -1 );
+    addfd( epollfd, listenfd );
+
+    ret = socketpair( PF_UNIX, SOCK_STREAM, 0, pipefd );
+    assert( ret != -1 );
+    setnonblocking( pipefd[1] );
+    addfd( epollfd, pipefd[0] );
+
+    // add all the interesting signals here
+    addsig( SIGALRM );
+    addsig( SIGTERM );
+    bool stop_server = false;
+
+    client_data* users = new client_data[FD_LIMIT]; 
+    bool timeout = false;
+    alarm( TIMESLOT );
+
+    while( !stop_server )
+    {
+        int number = epoll_wait( epollfd, events, MAX_EVENT_NUMBER, -1 );
+        if ( ( number < 0 ) && ( errno != EINTR ) )
+        {
+            printf( "epoll failure\n" );
+            break;
+        }
+    
+        for ( int i = 0; i < number; i++ )
+        {
+            int sockfd = events[i].data.fd;
+            if( sockfd == listenfd )
+            {
+                struct sockaddr_in client_address;
+                socklen_t client_addrlength = sizeof( client_address );
+                int connfd = accept( listenfd, ( struct sockaddr* )&client_address, &client_addrlength );
+                addfd( epollfd, connfd );
+                users[connfd].address = client_address;
+                users[connfd].sockfd = connfd;
+				/* 创建定时器，设置其回调函数与超时时间，然后绑定定时器与用户数据，最后将定时器添加到链表timer_1st 中 */
+                util_timer* timer = new util_timer;
+                timer->user_data = &users[connfd];
+                timer->cb_func = cb_func;
+                time_t cur = time( NULL );
+                timer->expire = cur + 3 * TIMESLOT;
+                users[connfd].timer = timer;
+                timer_lst.add_timer( timer );
+            }
+            else if( ( sockfd == pipefd[0] ) && ( events[i].events & EPOLLIN ) )
+            {
+                int sig;
+                char signals[1024];
+                ret = recv( pipefd[0], signals, sizeof( signals ), 0 );
+                if( ret == -1 )
+                {
+                    // handle the error
+                    continue;
+                }
+                else if( ret == 0 )
+                {
+                    continue;
+                }
+                else
+                {
+                    for( int i = 0; i < ret; ++i )
+                    {
+                        switch( signals[i] )
+                        {
+                            case SIGALRM:
+                            {
+                                timeout = true;
+                                break;
+                            }
+                            case SIGTERM:
+                            {
+                                stop_server = true;
+                            }
+                        }
+                    }
+                }
+            }
+            else if(  events[i].events & EPOLLIN )
+            {
+                memset( users[sockfd].buf, '\0', BUFFER_SIZE );
+                ret = recv( sockfd, users[sockfd].buf, BUFFER_SIZE-1, 0 );
+                printf( "get %d bytes of client data %s from %d\n", ret, users[sockfd].buf, sockfd );
+                util_timer* timer = users[sockfd].timer;
+                if( ret < 0 )
+                {
+                    if( errno != EAGAIN )
+                    {
+                        cb_func( &users[sockfd] );
+                        if( timer )
+                        {
+                            timer_lst.del_timer( timer );
+                        }
+                    }
+                }
+                else if( ret == 0 )
+                {
+                    cb_func( &users[sockfd] );
+                    if( timer )
+                    {
+                        timer_lst.del_timer( timer );
+                    }
+                }
+                else
+                {
+					/* 如果某个客户连接上有数据可读，则我们要调整该连接对应的定时器，以延迟该连接被关闭的时间*/
+                    if( timer )
+                    {
+                        time_t cur = time( NULL );
+                        timer->expire = cur + 3 * TIMESLOT;
+                        printf( "adjust timer once\n" );
+                        timer_lst.adjust_timer( timer );
+                    }
+                }
+            }
+            else
+            {
+                // others
+            }
+        }
+		/* 最后处理定时事件，因为 工/O 事件有更高的优先级。当然，这样做将导致定时任务不能精确
+地按照 预期的时间执行*/
+        if( timeout )
+        {
+            timer_handler();
+            timeout = false;
+        }
+    }
+
+    close( listenfd );
+    close( pipefd[1] );
+    close( pipefd[0] );
+    delete [] users;
+    return 0;
+}
+```
+
+
+### 3. I/O复用系统调用的超时参数
+
+Linux 下的3组IO复用系统调用都带有超时参数，因此它们不仅能统一处理信号和I/O事件，也能统一处理定时事件。但是由于IO复用系统调用可能在超时时间到期之前就返回(有I/O事件发生)，所以如果我们要利用它们来定时，就需要不断更新定时参数以反映剩余的时间，如代码所示。
+
+
+
+<div align="center" style="font-weight:900;font-size:larger">利用I/O复用系统调用定时</div>
+
+```cpp
+
+#define TIMEOUT 5000
+
+int timeout = TIMEOUT;
+time_t start = time( NULL );
+time_t end = time( NULL );
+while( 1 )
+{
+    printf( "the timeout is now %d mill-seconds\n", timeout );
+    start = time( NULL );
+    int number = epoll_wait( epollfd, events, MAX_EVENT_NUMBER, timeout );
+    if( ( number < 0 ) && ( errno != EINTR ) )
+    {
+        printf( "epoll failure\n" );
+        break;
+    }
+	/* 如果 epoll_wait 成功返回 0，则说明超时时间到，此时便可处理定时任务，并重置定时时间 */
+    if( number == 0 )
+    {
+        // timeout
+        timeout = TIMEOUT;
+        continue;
+    }
+
+    end = time( NULL );
+	/* 如果epol1 wait的返回值大于0，则本次epollwait调用持续的时间是（ end - start ）
+1000 ms，我们需要将定时时间timeout 减去这段时间，以获得下次epoll_wait 调用的超时参数 */
+    timeout -= ( end - start ) * 1000;
+	/* 重新计算之后的 timeout 值有可能等于0，说明本次epol1_wait 调用返回时，不仅有文件描述符就 绪，而且其超时时间也刚好到达，此时我们也要处理定时任务，并重置定时时间 */
+    if( timeout <= 0 )
+    {
+        // timeout
+        timeout = TIMEOUT;
+    }
+
+    // handle connections
+}
+
+```
+
+### 4.高性能定时器
+#### 4.1时间轮
+前文提到，基于排序链表的定时器存在一个问题 ∶添加定时器的效率偏低。下面我们要讨论的时间轮解决了这个问题。
+
+![时间轮.png](https://i.loli.net/2021/09/17/G3MBP2rNtQKV79j.png)
+
+
+如图所示的时间轮内，(实线）指针指向轮子上的一个槽（slot)。它以恒定的速度顺时针转动，每转动一步就指向下一个槽（虚线指针指向的槽)，每次转动称为一个滴答(tick)。一个滴答的时间称为时间轮的槽间隔si (slot interval)，它实际上就是心搏时间。该时间轮共有N个槽，因此它运转一周的时间是N*si。每个槽指向一条定时器链表，每条链表上的定时器具有相同的特征:它们的定时时间相差N*si的整数倍。时间轮正是利用这个关系将定时器散列到不同的链表中。假如现在指针指向槽cs，我们要添加一个定时时间为ti的定时器，则该定时器将被插入槽ts (timer slot）对应的链表中:
+<p align="center" > ts = (cs + (ti / si)) % N </p>
+
+基于排序链表的定时器使用唯一的一条链表来管理所有定时器，所以插入操作的效率随着定时器数目的增多而降低。而时间轮使用哈希表的思想，将定时器散列到不同的链表上。这样每条链表上的定时器数目都将明显少于原来的排序链表上的定时器数目，插人操作的效率基本不受定时器数目的影响。
+很显然，对时间轮而言，要提高定时精度，就要使si值足够小;要提高执行效率，则要求N值足够大。
+上图描述的是一种简单的时间轮，因为它只有一个轮子。而复杂的时间轮可能有多个轮子，不同的轮子拥有不同的粒度。相邻的两个轮子，精度高的转一圈，精度低的仅往前移动一槽，就像水表一样。下面将按照图11-1来编写一个较为简单的时间轮实现代码，如代码所示
+
+<div align="center" style="font-weight:900;font-size:larger"> 时间轮</div>
+
+```cpp
+
+#ifndef TIME_WHEEL_TIMER
+#define TIME_WHEEL_TIMER
+
+#include <time.h>
+#include <netinet/in.h>
+#include <stdio.h>
+
+#define BUFFER_SIZE 64
+class tw_timer;
+/* 绑定socket和定时器 */
+struct client_data
+{
+    sockaddr_in address;
+    int sockfd;
+    char buf[ BUFFER_SIZE ];
+    tw_timer* timer;
+};
+
+/* 定时器类 */
+class tw_timer
+{
+public:
+    tw_timer( int rot, int ts ) 
+    : next( NULL ), prev( NULL ), rotation( rot ), time_slot( ts ){}
+
+public:
+    int rotation;			/* 记录定时器在时间轮转多少围后生效*/
+    int time_slot;			/* 记录定时器属于时间轮上哪个槽（对应的链表，下同）*/
+    void (*cb_func)( client_data* );
+    client_data* user_data;
+    tw_timer* next;
+    tw_timer* prev;
+};
+
+
+class time_wheel
+{
+public:
+    time_wheel() : cur_slot( 0 )
+    {
+        for( int i = 0; i < N; ++i )
+        {
+            slots[i] = NULL;		*初始化每个槽的头结点 */
+        }
+    }
+    ~time_wheel()
+    {
+		/* 遍历每个槽，并销毁其中的定时器 */
+        for( int i = 0; i < N; ++i )
+        {
+            tw_timer* tmp = slots[i];
+            while( tmp )
+            {
+                slots[i] = tmp->next;
+                delete tmp;
+                tmp = slots[i];
+            }
+        }
+    }
+	/*根据定时值 timeout 创建一个定时器，并把它插入合适的槽中 */
+    tw_timer* add_timer( int timeout )
+    {
+        if( timeout < 0 )
+        {
+            return NULL;
+        }
+		/* 下面根据待插入定时器的超时值计算它将在时间轮转动多少个滴答后被触发，并将该滴答数存
+储于变量ticks 中。如果待插入定时器的超时值小于时间轮的槽间隔 SI，则将ticks 向上折合为1，否则就将ticks 向下折合为timeout/SI*/
+        int ticks = 0;
+        if( timeout < TI )
+        {
+            ticks = 1;
+        }
+        else
+        {
+            ticks = timeout / TI;
+        }
+		/* 计算待插入的定时器在时间轮转动多少圈后被触发 */
+        int rotation = ticks / N;
+		/* 计算待插入的定时器应该被插入哪个槽中*/
+        int ts = ( cur_slot + ( ticks % N ) ) % N;
+		/* 创建新的定时器，它在时间轮转动 rotation 圈之后被触发，且位于第 ts 个槽上 */
+        tw_timer* timer = new tw_timer( rotation, ts );
+		/*如果第ts个槽中尚无任何定时器，则把新建的定时器插入其中，并将该定时器设置为该槽的头节点 */
+        if( !slots[ts] )
+        {
+            printf( "add timer, rotation is %d, ts is %d, cur_slot is %d\n", rotation, ts, cur_slot );
+            slots[ts] = timer;
+        }
+		/* 否则，将定时器插入第 ts 个槽中 */
+        else
+        {
+            timer->next = slots[ts];
+            slots[ts]->prev = timer;
+            slots[ts] = timer;
+        }
+        return timer;
+    }
+
+
+    void del_timer( tw_timer* timer )
+    {
+        if( !timer )
+        {
+            return;
+        }
+        int ts = timer->time_slot;
+		/* slots[ts]是目标定时器所在槽的头结点。如果目标定时器就是该头结点，则需要重置第ts个槽的头节点 */
+        if( timer == slots[ts] )
+        {
+            slots[ts] = slots[ts]->next;
+            if( slots[ts] )
+            {
+                slots[ts]->prev = NULL;
+            }
+            delete timer;
+        }
+        else
+        {
+            timer->prev->next = timer->next;
+            if( timer->next )
+            {
+                timer->next->prev = timer->prev;
+            }
+            delete timer;
+        }
+    }
+	/* SI时间到后，调用该函数，时间轮向前滚动一个槽的间隔 */
+    void tick()
+    {
+        tw_timer* tmp = slots[cur_slot];
+        printf( "current slot is %d\n", cur_slot );
+        while( tmp )
+        {
+            printf( "tick the timer once\n" );
+			/* 如果定时器的rotation值大于 0，则它在这一轮不起作用 */
+            if( tmp->rotation > 0 )
+            {
+                tmp->rotation--;
+                tmp = tmp->next;
+            }
+			/* 否则，说明定时器已经到期，于是执行定时任务，然后删除该定时器 */
+            else
+            {
+                tmp->cb_func( tmp->user_data );
+                if( tmp == slots[cur_slot] )
+                {
+                    printf( "delete header in cur_slot\n" );
+                    slots[cur_slot] = tmp->next;
+                    delete tmp;
+                    if( slots[cur_slot] )
+                    {
+                        slots[cur_slot]->prev = NULL;
+                    }
+                    tmp = slots[cur_slot];
+                }
+                else
+                {
+                    tmp->prev->next = tmp->next;
+                    if( tmp->next )
+                    {
+                        tmp->next->prev = tmp->prev;
+                    }
+                    tw_timer* tmp2 = tmp->next;
+                    delete tmp;
+                    tmp = tmp2;
+                }
+            }
+        }
+		/* 更新时间轮的当前槽，以反映时间轮的转动 */
+        cur_slot = ++cur_slot % N;
+    }
+
+private:
+    static const int N = 60;		/* 时间轮上的槽的数目 */
+    static const int TI = 1;		/* 每1s时间轮转动一次 */
+    tw_timer* slots[N];				/* 时间轮的槽，其中每一个元素指向一个定时器链表，*/
+    int cur_slot;					/* 时间轮的当前槽 */
+};
+
+#endif
+```
+可见，对时间轮而言，添加一个定时器的时间复杂度是O（1），删除一个定时器的时间复杂度也是О(1)，执行一个定时器的时间复杂度是O(n)。但实际上执行一个定时器任务的效率要比О (n)好得多，因为时间轮将所有的定时器散列到了不同的链表上。时间轮的槽越多，等价于散列表的入口( entry)越多，从而每条链表上的定时器数量越少。此外，我们的代码仅使用了一个时间轮。当使用多个轮子来实现时间轮时，执行一个定时器任务的时间复杂度将接近О (1)。
+
+
+
+#### 4.2 时间堆
+
+
+前面讨论的定时方案都是以固定的频率调用心搏函数tick，并在其中依次检测到期的定时器，然后执行到期定时器上的回调函数。设计定时器的另外一种思路是﹔将所有定时器中超时时间最小的一个定时器的超时值作为心搏间隔。这样，一旦心搏函数tick被调用，超时时间最小的定时器必然到期，我们就可以在 tick函数中处理该定时器。然后，再次从剩余的定时器中找出超时时间最小的一个，并将这段最小时间设置为下一次心搏间隔。如此反复，就实现了较为精确的定时。
+最小堆很适合处理这种定时方案。最小堆是指每个节点的值都小于或等于其子节点的值的完全二叉树。
+树的基本操作是插入节点和删除节点。对最小堆而言，它们都很简单。为了将一个元素X插人最小堆，我们可以在树的下一个空闲位置创建一个空穴。如果X可以放在空穴中而不破坏堆序，则插入完成。否则就执行上虑操作，即交换空穴和它的父节点上的元素。不断执行上述过程，直到X可以被放入空穴，则插入操作完成。比如，我们要往图11-2所示的最小堆中插入值为14的元素，则可以按照下图所示的步骤来操作。
+
+![最小堆插入.png](https://i.loli.net/2021/09/17/wE8iNGVs3jna4Oq.png)
+
+最小堆的删除操作指的是删除其根节点上的元素，并且不破坏堆序性质。执行删除操作时，我们需要先在根节点处创建一个空穴。由于堆现在少了一个元素，因此我们可以把堆的最后一个元素X移动到该堆的某个地方。如果X可以被放入空穴，则删除操作完成。否则就执行下虑操作，即交换空穴和它的两个儿子节点中的较小者。不断进行上述过程，直到X可以被放入空穴，则删除操作完成。比如，我们要对图11-2所示的最小堆执行删除操作，则可以按照下图所示的步骤来执行。
+
+![最小堆删除.png](https://i.loli.net/2021/09/17/MkuvBK54mfZegqS.png)
+
+由于最小堆是一种完全二叉树，所以我们可以用数组来组织其中的元素.对于数组中的任意一个位置i上的元素，其左儿子节点在位置2+1上，其右儿子节点在位置2i+2上，其父节点则在位置〔(i-1)/2](>0)上。与用链表来表示堆相比，用数组表示堆不仅节省空间，而且更容易实现堆的插人、删除等操作.
+
+
+
+<div align="center" style="font-size:larger;font-weight:900">时间堆</div>
+
+```cpp
+
+#ifndef intIME_HEAP
+#define intIME_HEAP
+
+#include <iostream>
+#include <netinet/in.h>
+#include <time.h>
+using std::exception;
+
+#define BUFFER_SIZE 64
+
+class heap_timer;
+struct client_data
+{
+    sockaddr_in address;
+    int sockfd;
+    char buf[ BUFFER_SIZE ];
+    heap_timer* timer;
+};
+
+class heap_timer
+{
+public:
+    heap_timer( int delay )
+    {
+        expire = time( NULL ) + delay;
+    }
+
+public:
+   time_t expire;
+   void (*cb_func)( client_data* );
+   client_data* user_data;
+};
+
+class time_heap
+{
+public:
+	/* 构造函数之一，初始化一个大小为 cap 的空堆 */
+    time_heap( int cap ) throw ( std::exception )
+        : capacity( cap ), cur_size( 0 )
+    {
+		array = new heap_timer* [capacity];		/* 创建堆数组*/
+		if ( ! array )
+	{
+        throw std::exception();
+	}
+        for( int i = 0; i < capacity; ++i )
+        {
+            array[i] = NULL;
+        }
+    }
+	/* 构造函数之二，用已有数组来初始化堆 */
+    time_heap( heap_timer** init_array, int size, int capacity ) throw ( std::exception )
+        : cur_size( size ), capacity( capacity )
+    {
+        if ( capacity < size )
+        {
+            throw std::exception();
+        }
+        array = new heap_timer* [capacity];
+        if ( ! array )
+        {
+            throw std::exception();
+        }
+        for( int i = 0; i < capacity; ++i )
+        {
+            array[i] = NULL;
+        }
+        if ( size != 0 )
+        {
+            for ( int i =  0; i < size; ++i )
+            {
+                array[ i ] = init_array[ i ];
+            }
+			/* 对数组中的第〔（cur_size-1）/2】~0个元素执行下虑操作 */
+            for ( int i = (cur_size-1)/2; i >=0; --i )
+            {
+                percolate_down( i );
+            }
+        }
+    }
+    ~time_heap()
+    {
+        for ( int i =  0; i < cur_size; ++i )
+        {
+            delete array[i];
+        }
+        delete [] array; 
+    }
+
+public:
+    void add_timer( heap_timer* timer ) throw ( std::exception )
+    {
+        if( !timer )
+        {
+            return;
+        }
+        if( cur_size >= capacity )		/* 如果当前堆数组容量不够，则将其扩大1倍 */
+        {
+            resize();
+        }
+        int hole = cur_size++;			/* 新插入了一个元素，当前堆大小加1，hole 是新建空穴的位置*/
+        int parent = 0;
+		/* 对从空穴到根节点的路径上的所有节点执行上虑操作 */
+        for( ; hole > 0; hole=parent )
+        {
+            parent = (hole-1)/2;
+            if ( array[parent]->expire <= timer->expire )
+            {
+                break;
+            }
+            array[hole] = array[parent];
+        }
+        array[hole] = timer;
+    }
+    void del_timer( heap_timer* timer )
+    {
+        if( !timer )
+        {
+            return;
+        }
+		/* 仅仅将目标定时器的回调函数设置为空，即所谓的延迟销毁。这将节省真正删除该定时器造 成的开销，但这样做容易使堆数组膨胀 */
+        timer->cb_func = NULL;
+    }
+    heap_timer* top() const
+    {
+        if ( empty() )
+        {
+            return NULL;
+        }
+        return array[0];
+    }
+	/* 删除堆顶部的定时器 */
+    void pop_timer()
+    {
+        if( empty() )
+        {
+            return;
+        }
+        if( array[0] )
+        {
+            delete array[0];
+			/* 将原来的堆顶元素替换为堆数组中最后一个元素 */
+            array[0] = array[--cur_size];
+            percolate_down( 0 );			 /* 对新的堆顶元素执行下虑操作 */
+        }
+    }
+    void tick()
+    {
+        heap_timer* tmp = array[0];
+        time_t cur = time( NULL );				/* 循环处理堆中到期的定时器*/
+        while( !empty() )
+        {
+            if( !tmp )
+            {
+                break;
+            }
+			/* 如果堆顶定时器没到期，则退出循环 */
+            if( tmp->expire > cur )
+            {
+                break;
+            }
+			/* 否则就执行堆顶定时器中的任务 */
+            if( array[0]->cb_func )
+            {
+                array[0]->cb_func( array[0]->user_data );
+            }
+			/* 将堆顶元素删除，同时生成新的堆顶定时器（array【0】）*/
+            pop_timer();
+            tmp = array[0];
+        }
+    }
+    bool empty() const { return cur_size == 0; }
+
+private:
+	/*最小堆的下虑操作，它确保堆数组中以第 hole个节点作为根的子树拥有最小堆性质 */
+    void percolate_down( int hole )
+    {
+        heap_timer* temp = array[hole];
+        int child = 0;
+        for ( ; ((hole*2+1) <= (cur_size-1)); hole=child )
+        {
+            child = hole*2+1;
+            if ( (child < (cur_size-1)) && (array[child+1]->expire < array[child]->expire ) )
+            {
+                ++child;
+            }
+            if ( array[child]->expire < temp->expire )
+            {
+                array[hole] = array[child];
+            }
+            else
+            {
+                break;
+            }
+        }
+        array[hole] = temp;
+    }
+    void resize() throw ( std::exception )
+    {
+        heap_timer** temp = new heap_timer* [2*capacity];
+        for( int i = 0; i < 2*capacity; ++i )
+        {
+            temp[i] = NULL;
+        }
+        if ( ! temp )
+        {
+            throw std::exception();
+        }
+        capacity = 2*capacity;
+        for ( int i = 0; i < cur_size; ++i )
+        {
+            temp[i] = array[i];
+        }
+        delete [] array;
+        array = temp;
+    }
+
+private:
+    heap_timer** array;		/* 堆数组 */
+    int capacity;			/* 容量 */
+    int cur_size;			/* 堆数组当前的容量 */
+};
+
+#endif
+
+```
+
+==对时间堆而言，添加一个定时器的时间复杂度是 O（lgn），删除一个定时器的时间复杂度是 O（1），执行一个定时器的时间复杂度是 O（1）==。因此，时间堆的效率是很高的。
+
+
+
+## 高性能I/O框架库Libevent
+
+前面我们利用三章的篇幅较为细致地讨论了Linux服务器程序必须处理的三类事件:IO事件、信号和定时事件。在处理这三类事件时我们通常需要考虑如下三个问题:
+- 统一事件源。很明显，统一处理这三类事件既能使代码简单易懂，又能避免一些潜在的逻辑错误。前面我们已经讨论了实现统一事件源的一般方法——利用I/O复用系统调用来管理所有事件。
+- 可移植性。不同的操作系统具有不同的I/O复用方式，比如Solaris的devipoll 文件，FreeBSD 的kqueue机制，Linux 的epoll系列系统调用。
+- 对并发编程的支持。在多进程和多线程环境下，我们需要考虑各执行实体如何协同处理客户连接、信号和定时器，以避免竞态条件。
+
+
+### 1. I/O框架库概述
+
+I/O框架库以库函数的形式，封装了较为底层的系统调用，给应用程序提供了一组更便于使用的接口。这些库函数往往比程序员自己实现的同样功能的函数更合理、更高效，且更健壮。因为它们经受住了真实网络环境下的高压测试，以及时间的考验。
+各种lO框架库的实现原理基本相似，要么以Reactor模式实现，要么以Proactor模式实现，要么同时以这两种模式实现。举例来说，基于Reactor模式的I/O框架库包含如下几个组件:句柄(Handle)、事件多路分发器（EventDemultiplexer)、事件处理器(EventHandler）和具体的事件处理器（ConcretcEventHandler)、Reactor。这些组件的关系如图所示。
+
+![IO框架组件.png](https://i.loli.net/2021/09/17/9a1JIVdi7Hqb5N4.png)
+
+
+1. 句柄
+IO框架库要处理的对象，即IO事件、信号和定时事件，统一称为事件源。一个事件源通常和-个句柄绑定在一起。句柄的作用是，当内核检测到就绪事件时，它将通过句柄来通知应用程序这一事件。在 Linux环境下，I/O事件对应的句柄是文件描述符，信号事件对应的句柄就是信号值。
+
+2. 事件多路分发器
+事件的到来是随机的、异步的。我们无法预知程序何时收到一个客户连接请求，又亦或收到一个暂停信号。所以程序需要循环地等待并处理事件，这就是事件循环。在事件循环中，等待事件一般使用IO复用技术来实现。IO框架库一般将系统支持的各种IO复用系统调用封装成统一的接口，称为事件多路分发器。事件多路分发器的demultiplcex方法是等待事件的核心函数，其内部调用的是select、poll、epoll_wait等函数。此外，事件多路分发器还需要实现register_event 和 remove_event方法，以供调用者往事件多路分发器中添加事件和从事件多路分发器中删除事件。
+
+3. 事件处理器和具体事件处理器
+事件处理器执行事件对应的业务逻辑。它通常包含一个或多个handle_event回调函数，这些回调函数在事件循环中被执行。I/O框架库提供的事件处理器通常是一个接口，用户需要继承它来实现自己的事件处理器，即具体事件处理器。因此，事件处理器中的回调函数一般被声明为虚函数，以支持用户的扩展。此外，事件处理器一般还提供一个get_handle方法，它返回与该事件处理器关联的句柄。那么，事件处理器和句柄有什么关系﹖当事件多路分发器检测到有事件发生时，它是通过句柄来通知应用程序的。因此，我们必须将事件处理器和句柄绑定，才能在事件发生时获取到正确的事件处理器。
+
+4. Reactor
+Reactor 是 I/O框架库的核心。它提供的几个主要方法是∶
+- handle_events。该方法执行事件循环。它重复如下过程:等待事件，然后依次处理所有就绪事件对应的事件处理器。
+- register_handler。该方法调用事件多路分发器的 register_event方法来往事件多路分发器中注册一个事件。
+- remove_handler。该方法调用事件多路分发器的remove_event方法来删除事件多路分发器中的一个事件。
+
+
+### 2.Libevent源码分析
+Libevent的特点：
+- 跨平台支持。Libevent支持Linux、UNIX 和Windows。
+- 统一事件源。Libevent对IO事件、信号和定时事件提供统一的处理。线程安全。Libevent使用libevent_pthreads库来提供线程安全支持。基于Reactor模式的实现。
+- 线程安全。Libevent使用libevent_pthreads库来提供线程安全支持。
+- 基于Reactor模式的实现。
