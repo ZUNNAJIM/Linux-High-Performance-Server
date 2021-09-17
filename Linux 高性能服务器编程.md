@@ -6126,7 +6126,6 @@ private:
 #endif
 
 ```
-
 ==对时间堆而言，添加一个定时器的时间复杂度是 O（lgn），删除一个定时器的时间复杂度是 O（1），执行一个定时器的时间复杂度是 O（1）==。因此，时间堆的效率是很高的。
 
 
@@ -6169,3 +6168,319 @@ Libevent的特点：
 - 统一事件源。Libevent对IO事件、信号和定时事件提供统一的处理。线程安全。Libevent使用libevent_pthreads库来提供线程安全支持。基于Reactor模式的实现。
 - 线程安全。Libevent使用libevent_pthreads库来提供线程安全支持。
 - 基于Reactor模式的实现。
+
+#### 2.1 一个实例
+
+<div align="center" style="font-weight:900;font-size:larger">Libevent实例</div>
+```cpp
+
+#include <sys/signal.h>
+#include <event.h>
+
+void signal_cb( int fd, short event, void* argc )
+{
+    struct event_base* base = ( event_base* )argc;
+    struct timeval delay = { 2, 0 };
+    printf( "Caught an interrupt signal; exiting cleanly in two seconds...\n" );
+    event_base_loopexit( base, &delay );
+}  
+
+void timeout_cb( int fd, short event, void* argc )
+{
+    printf( "timeout\n" );
+}
+
+int main()  
+{  
+    struct event_base* base = event_init();
+
+    struct event* signal_event = evsignal_new( base, SIGINT, signal_cb, base );
+    event_add( signal_event, NULL );
+
+    timeval tv = { 1, 0 };
+    struct event* timeout_event = evtimer_new( base, timeout_cb, NULL );
+    event_add( timeout_event, &tv );
+
+    event_base_dispatch( base );
+
+    event_free( timeout_event );
+    event_free( signal_event );
+    event_base_free( base );
+}  
+
+```
+
+上述代码虽然简单，但却基本上描述了Libevent 库的主要逻辑∶
+1. 调用event init 函数创建 event base 对象。一个event base 相当于一个 Reactor 实例。
+2. 创建具体的事件处理器，并设置它们所从属的Reactor实例。evsignal_new和evtimer_new分别用于创建信号事件处理器和定时事件处理器，它们是定义在 include/event2/event.h文件中的宏:
+
+```cpp
+#define evsignal_new(b, x, cb, arg)             \
+	event_new((b), (x), EV_SIGNAL|EV_PERSIST, (cb), (arg))
+#define evsignal_del(ev)        event_del(ev)
+#define evsignal_pending(ev, tv)    event_pending((ev), EV_SIGNAL, (tv))
+
+```
+
+它们的统一入口是event_new 函数，即用于创建通用事件处理器的函数。其定义是∶
+```cpp
+struct event* event_new(struct event_base* base, evutil_socket_fd fd, short events, void (*cb)(evutil_socket_t, short, void*), void* arg);
+```
+> base:指定新创建的事件处理器从属的Reactor。
+>
+> fd:指定与该事件处理器关联的句柄。创建I/O处理器时，应该给fd参数传递文件描述符。创建信号事件处理器时，应该给fd传递信号值。
+>
+> events参数指定事件类型，其可选值都定义在include/event2/event.h文件中：
+> ```cpp
+> #define EV_TIMEOUT	0x01		/* 定时事件 */
+> #define EV_READ		0x02		/* 可读事件 */
+> #define EV_WRITE		0x03		/* 可写事件 */
+> #define EV_SIGNAL		0x08		/* 信号事件 */
+> #define EV_PERSIST	0x10		/* 永久事件 */
+> /* 边沿触发事件，需要I/O复用系统调用支持，比如epoll */
+> #define EV_ET			0x20
+> ```
+>
+> cb参数指定目标事件对应的回调函数;
+> rg 参数则是 Reactor 传递给回调函数的参数。
+
+event_new 函数成功时返回一个 event 类型的对象，也就是 Libevent 的事件处理器。Libevent 用单词"event"来描述事件处理器，而不是事件，故约定如下：
+- 事件指的是一个句柄上绑定的事件，比如文件描述符0上的可读事件。
+- 事件处理器，也就是event结构体类型的对象，除了包含事件必须具备的两个要素(句柄和事件类型）外，还有很多其他成员，比如回调函数。
+- 事件由事件多路分发器管理，事件处理器则由事件队列管理。事件队列包括多种，比如event_base中的注册事件队列、活动事件队列和通用定时器队列，以及evmap中的IO事件队列、信号事件队列。关于这些事件队列，我们将在后文依次讨论。
+- 事件循环对一个被激活事件（就绪事件）的处理，指的是执行该事件对应的事件处理器中的回调函数。
+
+3. 调用event add函数，将事件处理器添加到注册事件队列中，并将该事件处理器对应的事件添加到事件多路分发器中。event_add函数相当于Reactor中的register_handler方法。
+
+4. 调用event_base_dispatch函数来执行事件循环。
+5. 事件循环结束后，使用*_free系列函数来释放系统资源。
+
+#### 2.2源代码组织结构
+Libevent 源代码中的目录和文件按照功能可划分为如下部分∶
+- 头文件目录include/event2。该目录是自Libevent主版本升级到2.0之后引入的，在1.4及更老的版本中并无此目录。该目录中的头文件是Libevent提供给应用程序使用的，比如，event.h头文件提供核心函数，http.h头文件提供HTTP协议相关服务，rpc.h头文件提供远程过程调用支持。
+- 源码根目录下的头文件。这些头文件分为两类:一类是对include/event2目录下的部分头文件的包装，另外一类是供Libevent 内部使用的辅助性头文件，它们的文件名都具有*-internal.h 的形式。
+- 通用数据结构目录compat/sys。该目录下仅有一个文件——queue.h。它封装了跨平台的基础数据结构，包括单向链表、双向链表、队列、尾队列和循环队列。
+- sample目录。它提供一些示例程序。
+- test目录。它提供一些测试代码。
+- WIN32-Code目录。它提供 Windows平台上的一些专用代码。
+- event.c文件。该文件实现Libevent的整体框架，主要是event和 event_base两个结构·体的相关操作。
+- devpoll.c、kqueue.c、evport.c、select.c、win32select.c、poll.c和epoll.c文件。它们分别封装了如下IO复用机制:/dev/poll、kqueue、event ports、POSIX select、Windowsselect、poll和epoll。这些文件的主要内容相似，都是针对结构体eventop(见后文)所定义的接口函数的具体实现。
+-  minheap-intcrnal.h文件。该文件实现了一个时间堆，以提供对定时事件的支持。signal.c文件。它提供对信号的支持。其内容也是针对结构体eventop 所定义的接口函数的具体实现。
+-  evmap.c文件。它维护句柄（文件描述符或信号)与事件处理器的映射关系。
+-  event_iocp.c文件。它提供对Windows IOCP (Input/Output Completion Port，输入输出完成端口）的支持。
+-  buffer*.c文件。它提供对网络IO缓冲的控制，包括:输入输出数据过滤，传输速率限制，使用SSL (Secure Sockets Layer）协议对应用数据进行保护，以及零拷贝文件传输等。
+-  evthread*.c文件。它提供对多线程的支持。
+-  listener.c文件。它封装了对监听socket的操作，包括监听连接和接受连接。
+-  logs.c文件。它是Libevent 的日志系统。
+-  evutil.c、evutil_rand.c、strlcpy.c和 arc4random.c文件。它们提供一些基本操作，比如生成随机数、获取socket地址信息、读取文件、设置socket属性等。
+-  evdns.c、http.c和 evrpc.c文件。它们分别提供了对 DNS协议、HTTP协议和RPC(Remote Procedure Call，远程过程调用）协议的支持。
+
+在整个源码中，event-internal.h、include/event2/event_structh、event.c 和 evmap.c 等 4个文件最为重要。它们定义了event 和 event base 结构体，并实现了这两个结构体的相关操作。
+
+#### 2.3 event结构体
+event 结构体封装了句柄、事件类型、回调函数，以及其他必要的标志和数据。该结构体在 include/event2/event_struct.h 文件中定义∶
+
+```cpp
+struct event_callback {
+	TAILQ_ENTRY(event_callback) evcb_active_next;
+	short evcb_flags;
+	ev_uint8_t evcb_pri;	/* smaller numbers are higher priority */
+	ev_uint8_t evcb_closure;
+	/* allows us to adopt for different types of events */
+        union {
+		void (*evcb_callback)(evutil_socket_t, short, void *);
+		void (*evcb_selfcb)(struct event_callback *, void *);
+		void (*evcb_evfinalize)(struct event *, void *);
+		void (*evcb_cbfinalize)(struct event_callback *, void *);
+	} evcb_cb_union;
+	void *evcb_arg;
+};
+
+struct event {
+	struct event_callback ev_evcallback;
+
+	/* for managing timeouts */
+	union {
+		TAILQ_ENTRY(event) ev_next_with_common_timeout;
+		int min_heap_idx;
+	} ev_timeout_pos;
+	evutil_socket_t ev_fd;
+
+	struct event_base *ev_base;
+
+	union {
+		/* used for io events */
+		struct {
+			LIST_ENTRY (event) ev_io_next;
+			struct timeval ev_timeout;
+		} ev_io;
+
+		/* used by signal events */
+		struct {
+			LIST_ENTRY (event) ev_signal_next;
+			short ev_ncalls;
+			/* Allows deletes in callback */
+			short *ev_pncalls;
+		} ev_signal;
+	} ev_;
+
+	short ev_events;
+	short ev_res;		/* result passed to event callback */
+	struct timeval ev_timeout;
+};
+
+```
+> ev_events:。它代表事件类型。其取值可以取事件类型标志的按为或（互相排斥的事件之外）。
+> ev_timeout_pos:这是一个联合体，它仅用于定时事件处理器。
+> ev_:这是一个联合体。所有具有相同文件描述符值的 I/O事件处理器通过 ev_.ev_io.ev_io_next 成员串联成一个尾队列，我们称之为 I/O事件队列;所有具有相同信号值的信号事件处理器通过 ev_.ev_signal.ev_signal_next 成员串联成一个尾队列，我们称之为信号事件队列。v.ev signal.ev ncalls 成员指定信号事件发生时，Reactor 需要执行多少次该事件对应的事件处理器中的回调函数。ev_.ev_signal.ev_pncalls指针成员要么是 NULL，要么指向 ev_.ev _signal.ev_ncalls。
+
+#### 2.4 往注册事件队列中添加事件处理器
+#### 2.5 往事件多路分发器中注册事件
+#### 2.6 eventop结构体
+eventop结构体封装了IO复用机制必要的一些操作，比如注册事件、等待事件等。它为event_base支持的所有后端IO复用机制提供了一个统一的接口。该结构体定义在event-internal.h 文件中，如代码所示:
+
+```cpp
+struct eventop {
+	/** The name of this backend. */
+	const char *name;			/* 后端I/O复用技术的名称 */
+	/** Function to set up an event_base to use this backend.  It should
+	 * create a new structure holding whatever information is needed to
+	 * run the backend, and return it.  The returned pointer will get
+	 * stored by event_init into the event_base.evbase field.  On failure,
+	 * this function should return NULL. */
+	void *(*init)(struct event_base *);		/* 初始化函数 */
+	/** Enable reading/writing on a given fd or signal.  'events' will be
+	 * the events that we're trying to enable: one or more of EV_READ,
+	 * EV_WRITE, EV_SIGNAL, and EV_ET.  'old' will be those events that
+	 * were enabled on this fd previously.  'fdinfo' will be a structure
+	 * associated with the fd by the evmap; its size is defined by the
+	 * fdinfo field below.  It will be set to 0 the first time the fd is
+	 * added.  The function should return 0 on success and -1 on error.
+	 */
+	 /* 注册事件 */
+	int (*add)(struct event_base *, evutil_socket_t fd, short old, short events, void *fdinfo);
+	/** As "add", except 'events' contains the events we mean to disable. */
+	/* 删除事件 */
+	int (*del)(struct event_base *, evutil_socket_t fd, short old, short events, void *fdinfo);
+	/** Function to implement the core of an event loop.  It must see which
+	    added events are ready, and cause event_active to be called for each
+	    active event (usually via event_io_active or such).  It should
+	    return 0 on success and -1 on error.
+	 */
+	 /* 等待事件 */
+	int (*dispatch)(struct event_base *, struct timeval *);
+	/** Function to clean up and free our data from the event_base. */
+	/* 释放I/O复用机制使用的资源 */
+	void (*dealloc)(struct event_base *);
+	/** Flag: set if we need to reinitialize the event base after we fork.
+	 */
+	int need_reinit;		/* 程序调用fork之后是否需要重新初始化event_base */
+	/** Bit-array of supported event_method_features that this backend can
+	 * provide. */
+	enum event_method_feature features;			/* I/O 复用技术支持的一些特性 */
+	/** Length of the extra information we should record for each fd that
+	    has one or more active events.  This information is recorded
+	    as part of the evmap entry for each fd, and passed as an argument
+	    to the add and del functions above.
+	 */
+	size_t fdinfo_len;
+
+```
+
+#### 2.7 event_base结构体
+
+#### 2.8 事件循环
+最后，我们讨论一下 Libevent的“动力”，即事件循环。Libevent中实现事件循环的函数是event_base_loop。该函数首先调用IO事件多路分发器的事件监听函数，以等待事件;当有事件发生时，就依次处理之。
+
+
+
+
+## 多线程编成
+
+### 1. fork系统调用
+Linux 下创建新进程的系统调用是 fork。其定义如下;
+```cpp
+#incldue <sys/types.h>
+#include <unisted.h>
+pid_t fork(void);
+```
+
+该函数的每次调用都返回两次，在父进程中返回的是子进程的PID，在子进程中则返回0。该返回值是后续代码判断当前进程是父进程还是子进程的依据。fork调用失败时返回-1,并设置errno。
+fork 函数复制当前进程，在内核进程表中创建一个新的进程表项。新的进程表项有很多属性和原进程相同，比如堆指针、栈指针和标志寄存器的值。但也有许多属性被赋予了新的值，比如该进程的PPID被设置成原进程的PID，信号位图被清除（原进程设置的信号处理函数不再对新进程起作用)。
+子进程的代码与父进程完全相同，同时它还会复制父进程的数据（堆数据、栈数据和静态数据)。数据的复制采用的是所谓的写时复制(copy on writte)，即只有在任一进程（父进程或子进程）对数据执行了写操作时，复制才会发生（先是缺页中断，然后操作系统给子进程分配内存并复制父进程的数据)。即便如此，如果我们在程序中分配了大量内存，那么使用fork 时也应当十分谨慎，尽量避免没必要的内存分配和数据复制。
+此外，创建子进程后，父进程中打开的文件描述符默认在子进程中也是打开的，且文件描述符的引用计数加1。不仅如此，父进程的用户根目录、当前工作目录等变量的引用计数均会加1。
+
+### 2.exec系列系统调用
+有时我们需要在子进程中执行其他程序，即替换当前进程映像，这就需要使用如下 exec系列函数之一∶
+```cpp
+#include <unisted.h>
+extern char** environ;
+
+int execl ( const char* path,const char* arg, ... );
+int execlp( const char* file, const char* arg, ... );
+int execle( const char* path，const char* arg，...， char* const envp[] );
+int execv ( const char* path, char* const argv[ ] );
+int execvp ( const char* file, char* const argv[] );
+int execve( const char* path，char* const argv[],char* const envp[] );
+```
+path参数指定可执行文件的完整路径，file参数可以接受文件名，该文件的具体位置则在环境变量PATH中搜寻。arg 接受可变参数，argv则接受参数数组，它们都会被传递给新程序(path或file指定的程序）的main函数。envp参数用于设置新程序的环境变量。如果未设置它，则新程序将使用由全局变量environ指定的环境变量。
+一般情况下，exec函数是不返回的，除非出错。它出错时返回-1，并设置errno。如果没出错，则原程序中 exec调用之后的代码都不会执行，因为此时原程序已经被exec的参数指定的程序完全替换（包括代码和数据)。
+
+
+### 3.处理僵尸进程
+对于多进程程序而言，父进程一般需要跟踪子进程的退出状态。因此，当子进程结束运行时，内核不会立即释放该进程的进程表表项，以满足父进程后续对该子进程退出信息的查询（如果父进程还在运行)。在子进程结束运行之后，父进程读取其退出状态之前，我们称该子进程处于僵尸态。另外一种使子进程进人僵尸态的情况是:父进程结束或者异常终止，而子进程继续运行。此时子进程的PPID将被操作系统设置为1，即 init进程。init进程接管了该子进程，并等待它结束。在父进程退出之后，子进程退出之前，该子进程处于僵尸态。
+由此可见，无论哪种情况，如果父进程没有正确地处理子进程的返回信息，子进程都将停留在僵尸态，并占据着内核资源。这是绝对不能容许的，毕竟内核资源有限。下面这对函数在父进程中调用，以等待子进程的结束，并获取子进程的返回信息，从而避免了僵尸进程的产生，或者使子进程的僵尸态立即结束:
+```cpp
+#include <sys/types.h>
+#include <sys/wait.h>
+pid_t wait(int* stat_loc);
+pid_t waitpid(pid_t pid, int* stat_loc, int options);
+```
+ wait 函数将阻塞进程，直到该进程的某个子进程结束运行为止。它返回结束运行的子进程的 PID，并将该子进程的退出状态信息存储于 stat loc参数指向的内存中。sys/waith头文件中定义了几个宏来帮助解释子进程的退出状态信息，如表所示。
+
+
+<div align="center" style="font-weight:900;font-size:larger">
+子进程状态信息
+</div>
+<div align="center">
+	<table align="center">
+		<tr align="center" style="font-weight:700;font-size:large">
+			<td>宏</td>
+			<td>含义</td>
+		</tr>
+		<tr>
+			<td>WIFEXITED(stat_val)</td>
+			<td>如果子进程正常结束，它就返回一个非 0值</td>
+		</tr>
+		<tr>
+			<td>WEXITSTATUS(stat_val)</td>
+			<td>如果 WIFEXITED非 0，它返回子进程的退出码</td>
+		</tr>
+		<tr>
+			<td>WIFSIGNALED(stat_val)</td>
+			<td>如果子进程是因为一个未捕获的信号而终止，它就返回一个非 0值</td>
+		</tr>
+		<tr>
+			<td>WTERMSIG(stat_val)</td>
+			<td>如果 WIFSIGNALED非 0，它返回一个信号值</td>
+		</tr>
+		<tr>
+			<td>WIFSTOPPED(stat_val)</td>
+			<td>如果子进程意外终止，它就返回一个非 0值</td>
+		</tr>
+		<tr>
+			<td>WSTOPSIG(stat_val)</td>
+			<td>如果 WIFSTOPPED 非 0，它返回一个信号值</td>
+		</tr>
+	</table>
+</div>
+
+
+wait函数的阻塞特性显然不是服务器程序期望的，而 waitpid函数解决了这个问题。waitpid只等待由pid参数指定的子进程。如果pid取值为-1，那么它就和 wait 函数相同，即等待任意一个子进程结束。stat_loc参数的含义和wait函数的stat_loc参数相同。options 参数可以控制waitpid函数的行为。该参数最常用的取值是WNOHANG。当options 的取值是WNOHANG时，waitpid调用将是非阻塞的:如果pid指定的目标子进程还没有结束或意外终止，则 waitpid立即返回0﹔如果目标子进程确实正常退出了，则waitpid返回该子进程的PID。waitpid 调用失败时返回-1并设置errno。
+
+
+### 4.管道
+
+
+### 5.信号量
+#### 5.1信号量原语
