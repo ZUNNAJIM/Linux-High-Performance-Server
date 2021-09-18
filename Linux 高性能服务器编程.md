@@ -3436,7 +3436,7 @@ epoll系列系统调用的主要接口是 epoll_wait 函数。它在一段超时
 int epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout);
 ```
 该函数成功时返回就绪的文件描述符的个数，失败时返回-1 并设置 errno。
-meout 参数的含义与 poll接口的 timeout 参数相同。maxevents 参数指定最多监听多少个事件，它必须大于 0。
+timeout 参数的含义与 poll接口的 timeout 参数相同。maxevents 参数指定最多监听多少个事件，它必须大于 0。
 epoll_wait 函数如果检测到事件，就将所有就绪的事件从内核事件表（由 epfd 参数指定）中复制到它的第二个参数events 指向的数组中。这个数组只用于输出 epoll_wait 检测到的就绪事件，而不像 select 和 poll 的数组参数那样既用于传入用户注册的事件，又用于输出内核检测到的就绪事件。这就极大地提高了应用程序索引就绪文件描述符的效率。
 
 <div align="center" style="font-size:larger;font-weight:900">poll和epoll在使用上的差别</div>
@@ -6484,3 +6484,1020 @@ wait函数的阻塞特性显然不是服务器程序期望的，而 waitpid函�
 
 ### 5.信号量
 #### 5.1信号量原语
+当多个进程同时访问系统上的某个资源的时候，比如同时写一个数据库的某条记录，或者同时修改某个文件，就需要考虑进程的同步问题，以确保任一时刻只有一个进程可以拥有对资源的独占式访问。通常，程序对共享资源的访问的代码只是很短的一段，但就是这一段代码引发了进程之间的竞态条件。我们称这段代码为关键代码段，或者临界区。对进程同步，也就是确保任一时刻只有一个进程能进人关键代码段。
+
+Dijkstra提出的信号量(Semaphore）概念是并发编程领域迈出的重要一步。信号量是一种特殊的变量，它只能取自然数值并且只支持两种操作:等待(wait）和信号(signal)。不过在Linux/UNIX中，“等待”和“信号”都已经具有特殊的含义，所以对信号量的这两种操作更常用的称呼是P、V操作。这两个字母来自于荷兰语单词passeren（传递，就好像进人临界区）和vrijgeven（释放，就好像退出临界区)。假设有信号量SV，则对它的P、V操作含义如下：
+**==P(SV)，如果SV的值大于0，就将它减1;如果SV的值为0，则挂起进程的执行。==**
+**==V(SV)，如果有其他进程因为等待SV而挂起，则唤醒之;如果没有，则将SV加1。==**
+
+![使用信号量.png](https://i.loli.net/2021/09/18/CK9qU8SltIXZ5ah.png)
+
+当关键代码段可用时，二进制信号量SV的值为1,进程A和B都有机会进入关键代码段。如果此时进程A执行了P(sV)操作将SV减1，则进程B若再执行P(SV)操作就会被挂起。直到进程A离开关键代码段，并执行v(SV)操作将SV加1，关键代码段才重新变得可用。如果此时进程B因为等待sv而处于挂起状态，则它将被唤醒，并进人关键代码段。同样，这时进程A如果再执行P(SV)操作，则也只能被操作系统挂起以等待进程B退出关键代码段。
+
+
+
+> **注意﹑使用一个普通变量来模拟二进制信号量是行不通的，因为所有高级语言都没有一个原子操作可以同时完成如下两步操作:检测变量是否为true/false，如果是则再将它设置为false/true。**
+
+#### 5.3 semget系统调用
+semget 系统调用创建一个新的信号量集，或者获取一个已经存在的信号量集。其定义如下∶
+```cpp
+#include <sys/sem.h>
+int semget(key_t key, int num_sems. int sem_flags);
+```
+key参数是一个键值，用来标识一个全局唯一的信号量集，就像文件名全局唯一地标识一个文件一样。要通过信号量通信的进程需要使用相同的键值来创建/获取该信号量。
+num_sems参数指定要创建/获取的信号量集中信号量的数目。如果是创建信号量，则该值必须被指定;如果是获取已经存在的信号量，则可以把它设置为0。
+sem_flags参数指定一组标志。它低端的9个比特是该信号量的权限，其格式和含义都与系统调用open的 mode参数相同。此外，它还可以和IPC_CREAT标志做按位“或”运算以创建新的信号量集。此时即使信号量已经存在，semget也不会产生错误。我们还可以联合使用IPC_CREAT和IPC_EXCL标志来确保创建一组新的、唯一的信号量集。在这种情况下，如果信号量集已经存在，则semget返回错误并设置errno为EEXIST.这种创建信号量的行为与用O_CREAT和O_EXCL标志调用open 来排他式地打开一个文件相似。
+
+semget 成功时返回一个正整数值，它是信号量集的标识符;semget 失败时返回-1，并设置errno。
+
+如果 semget 用于创建信号量集，则与之关联的内核数据结构体 semid_ds 将被创建并初始化。semid_ds 结构体的定义如下∶
+```cpp
+#include <sys/sem.h>
+/* 该结构体用于庙是IPC 对象（信号量，共享内存，消息队列）的权限 */
+struct ipc_perm
+{
+	key_t key;			/* 键值 */
+	uid_t uid;			/* 所有者的有效用户ID */
+	gid_t gid;			/* 所有者的有效用户ID */
+	uid_t cuid;			/* 创建者的有效用户ID */
+	gid_t cgid;			/* 创建者的有效组ID */
+	mode_t mode;		/* 访问权限 */
+	...
+};
+
+struct semid_ds
+{
+	struct ipc_perm sem_perm;		/* 信号量的操作权限 */
+	unsigned long int sem_nsems;	/* 该信号量集中的信号量数目*/
+	time_t sem_otime;				/* 最后一次调用 semop的时间 */
+	time_t sem_ctime;				/* 最后一次调用semctl的时间 */
+	/* 忽略了的一些填充变量 */
+};
+```
+
+semget 对 semid_ds 结构体的初始化包括∶
+- 将sem_perm.cuid和sem_perm.uid设置为调用进程的有效用户ID。
+- 将sem _perm.cgid和sem_perm.gid设置为调用进程的有效组ID。
+- 将sem_perm.mode的最低9位设置为sem_flags参数的最低9位。
+- 将sem_nsems设置为num_sems。
+- 将sem_otime设置为0。
+- 将sem_ctime设置为当前的系统时间。
+
+
+
+#### 5.3 semop系统调用
+semop 系统调用改变信号量的值，即执行P、V操作。
+
+> 每个信号量关联的一些重要的内核变量∶
+> ```cpp
+> unsigned short semval;		/* 信号量的值*/
+> unsigned short semzcnt;		/*等待信号量值变为0的进程数量 */
+> unsigned short semncnt;		/* 等待信号量值增加的进程数量 */
+> pid_t sempid;					/* 最后一次执行 semop操作的进程 ID*/
+> ```
+
+scmop 对信号量的操作实际上就是对这些内核变量的操作。semop 的定义如下∶
+```cpp
+#incldue <sys/sem.h>
+int semop(int sem_id, struct sembuf* sem_ops, size_t num_sem_ops);
+```
+
+sem_id参数是由semget调用返回的信号量集标识符，用以指定被操作的目标信号量集。sem_ops参数指向一个sembuf结构体类型的数组，sembuf结构体的定义如下:
+```cpp
+struct sembuf
+{
+	/* sem num 成员是信号量集中信号量的编号，0表示信号量集中的第一个信号量。*/
+	unsigned short int sem_num;
+	/* em_op 成员指定操作类型，其可选值为正整数、0 和负整数。每种类型的操作的行为又受到sem_fig 成员的影响*/
+	short int sem_op;
+	/* 。sem_fig的可选值是 IPC_NOWAIT 和 SEM_UNDO。IPC_NOWAIT的含义是，无论信号量操作是否成功，semop 调用都将立即返回，这类似于非阻塞 I/O 操作。SEM_UNDO 的含义是，当进程退出时取消正在进行的 semop 操作。具体来说，sem_op 和sem_fig 将按照如下方式来影响 semop 的行为∶
+	1.如果sem_op大于0，则semop将被操作的信号量的值semval增加 sem_op。该操作要求调用进程对被操作信号量集拥有写权限。此时若设置了SEM_UNDO标志，则系统将更新进程的semadj变量（用以跟踪进程对信号量的修改情况)。
+	2.如果sem_op等于0，则表示这是一个“等待0”( wait-for-zero）操作。该操作要求调用进程对被操作信号量集拥有读权限。如果此时信号量的值是0，则调用立即成功返回。如果信号量的值不是0，则semop失败返回或者阻塞进程以等待信号量变为0。在这种情况下，当IPC_NOWAIT标志被指定时，semop立即返回一个错误，并设置errno为EAGAIN。如果未指定IPC_NOWAIT标志，则信号量的semzcnt值加1，进程被投入睡眠直到下列3个条件之一发生:1.信号量的值semval变为0，此时系统将该信号量的semzcnt值减l;2.被操作信号量所在的信号量集被进程移除，此时semop调用失败返回，errno被设置为EIDRM;3.调用被信号中断，此时semop调用失败返回，errno被设置为EINTR，同时系统将该信号量的semzcnt值减1。
+	3.如果sem_op小于0，则表示对信号量值进行减操作，即期望获得信号量。该操作要求调用进程对被操作信号量集拥有写权限。如果信号量的值semval 大于或等于sem_op的绝对值，则semop操作成功，调用进程立即获得信号量，并且系统将该信号量的semval值减去sem_op的绝对值。此时如果设置了SEM_UNDO标志，则系统将更新进程的semadj变量。如果信号量的值semval小于sem_op的绝对值，则semop失败返回或者阻塞进程以等待信号量可用。在这种情况下，当IPC_NOWAIT标志被指定时，semop立即返回一个错误，并设置errno为EAGAIN。如果未指定IPC_NOWAIT标志，则信号量的semncnt值加1，进程被投人睡眠直到下列3个条件之一发生:信号量的值semval变得大于或等于sem_op的绝对值，此时系统将该信号量的semncnt值减1，并将semval减去sem_op 的绝对值，同时，如果SEM_UNDO标志被设置，则系统更新semadj变量﹔被操作信号量所在的信号量集被进程移除，此时semop调用失败返回，errno被设置为EIDRM ;调用被信号中断，此时semop调用失败返回，errno被设置为EINTR，同时系统将该信号量的semncnt值减1。*/
+	short int sem_flg;
+}
+```
+semop系统调用的第3个参数num_sem_ops 指定要执行的操作个数，即 sem_ops 数组中元素的个数。semop对数组sem_ops中的每个成员按照数组顺序依次执行操作，并且该过程是原子操作，以避免别的进程在同--时刻按照不同的顺序对该信号集中的信号量执行semop操作导致的竞态条件。
+semop成功时返回0，失败则返回-1并设置errno。失败的时候，sem_ops数组中指定的所有操作都不被执行。
+
+
+#### 5.4 semctl系统调用
+semctl 系统调用允许调用者对信号量进行直接控制。其定义如下∶
+```cpp
+#include <sys/sem.h>
+int semctl(int sem_id, int sem_num, int command, ...);
+```
+sem_id参数是由semget调用返回的信号量集标识符，用以指定被操作的信号量集。sem_num参数指定被操作的信号量在信号量集中的编号。command参数指定要执行的命令。有的命令需要调用者传递第4个参数。第4个参数的类型由用户自己定义，但sys/sem.h头文件给出了它的推荐格式，具体如下:
+```cpp
+union semun
+{
+	int val;							/*用于SETVAL命令*/
+	struct semid_ds* buf;				/*用于IPc_STAT和IPc_SET命令*/
+	unsigned short* array;				/*用于GETALL和SETALL命令*/
+	struct seminfo*__buf;				/*用于IPC_INFO命令*f
+};
+
+struct seminfo
+{
+	int semmap;							/*Linux内核没有使用*/
+	int semmni;							/*系统最多可以拥有的信号量集数目*/
+	int semmns;							/*系统最多可以拥有的信号量数目*/
+	int semmnu ;						/*Linux内核没有使用*/
+	int semmsl ;						/*一个信号量集最多允许包含的信号量数目*/
+	int semopm;							/*semop 一次最多能执行的sem_op操作数目*/
+	int semume;							/*Linux内核没有使用*/
+	int semusZ;							/*sem_undo结构体的大小*/
+	int semvmx ;						/★最大允许的信号量值*/
+	/最多允许的UNDo次数（带SEM_UNDo标志的semop操作的次数〉* /
+	int semaem;
+};
+```
+
+<div align="center" style="font-weight:900;font-size:larger">
+semctl的command参数
+</div>
+
+![command参数.png](https://i.loli.net/2021/09/18/VAgROezQUDCPtXL.png)
+
+> 注意﹐这些操作中，GETNCNT、GETPID、GETVAL、GETZCNT 和SETVAL操作的是单个信号量，它是由标识符sem_id指定的信号量集中的第sem_num个信号量﹔而其他操作针对的是整个信号量集，此时semctl的参数sem_num被忽略。
+
+semctl 成功时的返回值取决于command参数。semctl失败时返回 -1， 并设置errno。
+
+
+#### 5.5 特殊键值IPC_PRIVATE
+semget的调用者可以给其key参数传递一个特殊的键值IPC_PRIVATE（其值为0)，这样无论该信号量是否已经存在，semget都将创建一个新的信号量。使用该键值创建的信号量并非像它的名字声称的那样是进程私有的。其他进程，尤其是子进程，也有方法来访问这个信号量。所以semget的 man手册的BUGS部分上说，使用名字IPC_PRIVATE有些误导（历史原因)，应该称为IPC_NEW。比如下面的代码就在父、子进程间使用一个IPC_PRIVATE信号量来同步。
+
+<div align="center" style="font-size:larger;font-weight:900">使用IPC_PRIVATE信号量</div>
+
+```cpp
+
+#include <sys/sem.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+union semun
+{
+     int val;                  
+     struct semid_ds* buf;     
+     unsigned short int* array;
+     struct seminfo* __buf;    
+};
+
+/* op 为 -1时执行P操作，op 为1时执行V操作*/
+void pv( int sem_id, int op )
+{
+    struct sembuf sem_b;
+    sem_b.sem_num = 0;
+    sem_b.sem_op = op;
+    sem_b.sem_flg = SEM_UNDO;
+    semop( sem_id, &sem_b, 1 );
+}
+
+int main( int argc, char* argv[] )
+{
+    int sem_id = semget( IPC_PRIVATE, 1, 0666 );
+
+    union semun sem_un;
+    sem_un.val = 1;
+    semctl( sem_id, 0, SETVAL, sem_un );
+
+    pid_t id = fork();
+    if( id < 0 )
+    {
+        return 1;
+    }
+    else if( id == 0 )
+    {
+        printf( "child try to get binary sem\n" );
+        pv( sem_id, -1 );
+        printf( "child get the sem and would release it after 5 seconds\n" );
+        sleep( 5 );
+        pv( sem_id, 1 );
+        exit( 0 );
+    }
+    else
+    {
+        printf( "parent try to get binary sem\n" );
+        pv( sem_id, -1 );
+        printf( "parent get the sem and would release it after 5 seconds\n" );
+        sleep( 5 );
+        pv( sem_id, 1 );
+    }
+
+    waitpid( id, NULL, 0 );
+    semctl( sem_id, 0, IPC_RMID, sem_un );
+    return 0;
+}
+```
+
+
+### 6.共享内存
+共享内存是最高效的IPC机制，因为它不涉及进程之间的任何数据传输。这种高效率带来的问题是，我们必须用其他辅助手段来同步进程对共享内存的访问，否则会产生竞态条件。因此，共享内存通常和其他进程间通信方式一起使用。
+
+
+#### 6.1 shmget系统调用
+shmget 系统调用创建一段新的共享内存，或者获取一段已经存在的共享内存。其定义如下∶```cpp
+#include <sys/shm.h>
+int shmget(key_t key, size_t size, int shmflg);
+```
+和semget系统调用一样，key参数是一个键值，用来标识一段全局唯一的共享内存。size参数指定共享内存的大小，单位是字节。如果是创建新的共享内存，则size值必须被指定。如果是获取已经存在的共享内存，则可以把size设置为0。
+shmflg参数的使用和含义与semget系统调用的sem_flags参数相同。不过shmget支持两个额外的标志——SHM_HUGETLB和SHM_NORESERVE。它们的含义如下:
+- SHM_HUGETLB，类似于mmap的MAP_HUGETLB标志，系统将使用“大页面”来为共享内存分配空间。
+- SHM_NORESERVE，类似于mmap的MAP_NORESERVE标志，不为共享内存保留交换分区(swap空间)。这样，当物理内存不足的时候，对该共享内存执行写操作将触发SIGSEGV信号。
+
+shmget 成功时返回一个正整数值，它是共享内存的标识符。shmget失败时返回-1，并设置 errno。
+
+如果 shmget 用于创建共享内存，则这段共享内存的所有字节都被初始化为 0，与之关联的内核数据结构 shmid ds 将被创建并初始化。shmid_ds 结构体的定义如下∶
+```cpp
+struct shmid_ds
+{
+	struct ipC_perm shm_perm;		/* 共享内存的操作权限 */ 
+	size_t shm_segsz;				/*共享内存大小，单位是字节*/ 
+	_time_t shm_atime;				/* 对这段内存最后一次调用 shmat 的时间 */ 
+	_time_t shm_dtime;				/* 对这段内存最后一次调用 shmdt 的时间 */
+	_time_t shm_ctime;				/* 对这段内存最后一次调用 shmct1的时间 */
+	_pid_t shm_cpid;				/*创建者的PID */
+	_pid_t shm_lpid;				/*最后一次执行shmat或shndt操作的进程的PID*/
+	shmatt_t shm_nattach;			/*目前关联到此共享内存的进程数量*/
+};
+```
+shmget对 shmid_ds结构体的初始化包括:
+- 将shm_perm.cuid和 shm _perm.uid设置为调用进程的有效用户ID。
+- 将shm_perm.cgid和 shm_perm.gid设置为调用进程的有效组ID。
+- 将shm_perm.mode的最低9位设置为shmflg 参数的最低9位。
+- 将shm_segsz设置为size.
+- 将shm_lpid、shm_nattach、shm_atime、shm_dtime设置为0。
+- 将shm_ctime设置为当前的时间。
+
+
+#### 6.2 shmat和shmdt
+
+共享内存被创建/获取之后，我们不能立即访问它，而是需要先将它关联到进程的地址空间中。使用完共享内存之后，我们也需要将它从进程地址空间中分离。这两项任务分别由如下两个系统调用实现:
+```cpp
+#include <sys/shm.h>
+void* shmat(int shm_id, const void* shm_addr, int shmflg);
+int shmdt(const void* shm_addr);
+```
+其中，shm_id参数是由shmget调用返回的共享内存标识符。shm_addr参数指定将共享内存关联到进程的哪块地址空间，最终的效果还受到shmflg参数的可选标志SHM_RND的影响:
+- 如果shm_addr为 NULL，则被关联的地址由操作系统选择。这是推荐的做法，以确保代码的可移植性。
+- 如果shm_addr非空，并且SHM_RND标志未被设置，则共享内存被关联到addr指定的地址处。
+- 如果shm_addr非空，并且设置了SHM_RND标志，则被关联的地址是[shm_addr-(shm_addr % SHMLBA)]。SHMLBA的含义是“段低端边界地址倍数”(SegmentLow Boundary Address Multiple)，它必须是内存页面大小(PAGE_SIZE）的整数倍。现在的Linux内核中，它等于一个内存页大小。SHM_RND的含义是圆整(round)，即将共享内存被关联的地址向下圆整到离shm_addr最近的SHMLBA的整数倍地址处。
+
+
+除了SHM RND 标志外，shmfig 参数还支持如下标志∶
+- SHM_RDONLY。进程仅能读取共享内存中的内容。若没有指定该标志，则进程可同时对共享内存进行读写操作（当然，这需要在创建共享内存的时候指定其读写权限)。SHM_REMAP。如果地址shmaddr已经被关联到一段共享内存上，则重新关联。
+- SHM_EXEC。它指定对共享内存段的执行权限。对共享内存而言，执行权限实际上和读权限是一样的。
+
+
+shmat 成功时返回共享内存被关联到的地址，失败则返回（void*）-1并设置 errno。shmat
+成功时，将修改内核数据结构 shmid_ds 的部分字段，如下∶
+- 将shm_nattach 加 1。
+- 将shm_lpid设置为调用进程的PID。
+- 将shm_atime 设置为当前的时间。
+
+
+shmdt函数将关联到shm_addr处的共享内存从进程中分离。它成功时返回0，失败则返回-1并设置errno。shmdt在成功调用时将修改内核数据结构shmid_ds 的部分字段，如下:
+- 将shm_nattach减1。
+- 将shm_lpid设置为调用进程的PID。
+- 将shm_dtime设置为当前的时间。
+
+
+
+#### 6.3 shmctl系统调用
+shmctl 系统调用控制共享内存的某些属性。其定义如下∶
+```cpp
+#include <sys/shm.h>
+int shmctl(int shm_id, int command, struct shmid_ds* buf);
+```
+
+其中，shm_id参数是由 shmget 调用返回的共享内存标识符。command参数指定要执行的命令。
+
+![shmctl的命令.png](https://i.loli.net/2021/09/18/gr7MH9nlFRVsDGk.png)
+
+
+#### 6.4 共享内存的POSIX方法
+```cpp
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+int shm_open(const char* name, int oflag, mode_t mode);
+```
+name 参数指定要创建/打开的共享内存对象。从可移植性的角度考虑，该参数应该使用"/somename"的格式∶以"/"开始，后接多个字符，且这些字符都不是"/";以"\0"结尾，长度不超过NAME_MAX（通常是 255）。
+
+oflag参数指定创建方式。它可以是下列标志中的一个或者多个的按位或:
+- O_RDONLY。以只读方式打开共享内存对象。
+- O_RDWR。以可读、可写方式打开共享内存对象。
+- O_CREAT。如果共享内存对象不存在，则创建之。此时mode参数的最低9位将指定该共享内存对象的访问权限。共享内存对象被创建的时候，其初始长度为0。
+- O_EXCL。和O_CREAT一起使用，如果由name指定的共享内存对象已经存在，则shm_open调用返回错误，否则就创建一个新的共享内存对象。
+- O_TRUNC。如果共享内存对象已经存在，则把它载断，使其长度为0。
+
+shm open 调用成功时返回一个文件描述符。该文件描述符可用于后续的 mmap 调用，从而将共享内存关联到调用进程。shm_open 失败时返回-1，并设置 errno。
+
+和打开的文件最后需要关闭一样，由 shm open 创建的共享内存对象使用完之后也需要被删除。这个过程是通过如下函数实现的∶
+```cpp
+#include <sys/mman.h>
+#icnlude <sys/stat.h>
+#include <fcntl.h>
+int shm_unlink(const char* name);
+```
+该函数将 name 参数指定的共享内存对象标记为等待删除。当所有使用该共享内存对象的进程都使用 ummap 将它从进程中分离之后，系统将销毁这个共享内存对象所占据的资源。
+
+**==如果代码中使用了上述 POSIX 共享内存函数，则编译的时候需要指定链接选项 -lrt。==**
+
+#### 6.5共享内存实例
+
+
+<div align="center" style="font-weight:900;font-size:larger">
+使用共享内存的聊天室服务器程序
+</div>
+
+```cpp
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define USER_LIMIT 5
+#define BUFFER_SIZE 1024
+#define FD_LIMIT 65535
+#define MAX_EVENT_NUMBER 1024
+#define PROCESS_LIMIT 65536
+
+/* 客户端数据 */
+struct client_data
+{
+    sockaddr_in address;			/* 客户端的 socket地址 */
+    int connfd;						/* socket文件描述符 */
+    pid_t pid;						/* 处理该连接的进程ID */
+    int pipefd[2];					/* 与父进程通信用的管道 */
+};
+
+static const char* shm_name = "/my_shm";
+int sig_pipefd[2];
+int epollfd;
+int listenfd;
+int shmfd;
+char* share_mem = 0;
+/* 客户连接数组。进程用客户连接的编号来索引这个数组，即可取得相关的客户连接数据 */
+client_data* users = 0;
+/* 子进程和客户连接的映射关系表。用进程的 PID来索引这个数组，即可取得该进程所处理的客户连接的编号 */
+int* sub_process = 0;
+int user_count = 0;
+bool stop_child = false;
+
+int setnonblocking( int fd )
+{
+    int old_option = fcntl( fd, F_GETFL );
+    int new_option = old_option | O_NONBLOCK;
+    fcntl( fd, F_SETFL, new_option );
+    return old_option;
+}
+
+void addfd( int epollfd, int fd )
+{
+    epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET;
+    epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
+    setnonblocking( fd );
+}
+
+void sig_handler( int sig )
+{
+    int save_errno = errno;
+    int msg = sig;
+    send( sig_pipefd[1], ( char* )&msg, 1, 0 );
+    errno = save_errno;
+}
+
+void addsig( int sig, void(*handler)(int), bool restart = true )
+{
+    struct sigaction sa;
+    memset( &sa, '\0', sizeof( sa ) );
+    sa.sa_handler = handler;
+    if( restart )
+    {
+        sa.sa_flags |= SA_RESTART;
+    }
+    sigfillset( &sa.sa_mask );
+    assert( sigaction( sig, &sa, NULL ) != -1 );
+}
+
+void del_resource()
+{
+    close( sig_pipefd[0] );
+    close( sig_pipefd[1] );
+    close( listenfd );
+    close( epollfd );
+    shm_unlink( shm_name );
+    delete [] users;
+    delete [] sub_process;
+}
+
+/* 停止一个进程 */
+void child_term_handler( int sig )
+{
+    stop_child = true;
+}
+
+/* 子进程运行的函数。参数idx指出该子进程处理的客户连接的编号，users 是保存所有客户连接数据的 数组，参数 share_mem 指出共享内存的起始地址 */
+int run_child( int idx, client_data* users, char* share_mem )
+{
+    epoll_event events[ MAX_EVENT_NUMBER ];
+	/* 子进程使用I/O 复用技术来同时监听两个文件描述符∶客户连接 socket、与父进程通信的管道文 件描述符*/
+    int child_epollfd = epoll_create( 5 );
+    assert( child_epollfd != -1 );
+    int connfd = users[idx].connfd;
+    addfd( child_epollfd, connfd );
+    int pipefd = users[idx].pipefd[1];
+    addfd( child_epollfd, pipefd );
+    int ret;
+	/* 子进程需要设置自己的信号处理函数 */
+    addsig( SIGTERM, child_term_handler, false );
+
+    while( !stop_child )
+    {
+        int number = epoll_wait( child_epollfd, events, MAX_EVENT_NUMBER, -1 );
+        if ( ( number < 0 ) && ( errno != EINTR ) )
+        {
+            printf( "epoll failure\n" );
+            break;
+        }
+
+        for ( int i = 0; i < number; i++ )
+        {
+            int sockfd = events[i].data.fd;
+			/* 本子进程负责的客户连接有数据到达 */
+            if( ( sockfd == connfd ) && ( events[i].events & EPOLLIN ) )
+            {
+                memset( share_mem + idx*BUFFER_SIZE, '\0', BUFFER_SIZE );
+				/* 将客户数据读取到对应的读缓存中。该读缓存是共享内存的一段，它开始于idx*BUFFER_SIZE处，长度为 BUFFER_SIzE 字节。因此，各个客户连接的读缓存是共享的 */
+                ret = recv( connfd, share_mem + idx*BUFFER_SIZE, BUFFER_SIZE-1, 0 );
+                if( ret < 0 )
+                {
+                    if( errno != EAGAIN )
+                    {
+                        stop_child = true;
+                    }
+                }
+                else if( ret == 0 )
+                {
+                    stop_child = true;
+                }
+                else
+                {
+					/* 成功读取客户数据后就通知主进程（通过管道）来处理 */
+                    send( pipefd, ( char* )&idx, sizeof( idx ), 0 );
+                }
+            }
+			/* 主进程通知本进程（通过管道）将第client个客户的数据发送到本进程负责的客户端 */
+            else if( ( sockfd == pipefd ) && ( events[i].events & EPOLLIN ) )
+            {
+                int client = 0;
+				/* 接收主进程发送来的数据，即有客户数据到达的连接的编号 */
+                ret = recv( sockfd, ( char* )&client, sizeof( client ), 0 );
+                if( ret < 0 )
+                {
+                    if( errno != EAGAIN )
+                    {
+                        stop_child = true;
+                    }
+                }
+                else if( ret == 0 )
+                {
+                    stop_child = true;
+                }
+                else
+                {
+                    send( connfd, share_mem + client * BUFFER_SIZE, BUFFER_SIZE, 0 );
+                }
+            }
+            else
+            {
+                continue;
+            }
+        }
+    }
+
+    close( connfd );
+    close( pipefd );
+    close( child_epollfd );
+    return 0;
+}
+
+int main( int argc, char* argv[] )
+{
+    if( argc <= 2 )
+    {
+        printf( "usage: %s ip_address port_number\n", basename( argv[0] ) );
+        return 1;
+    }
+    const char* ip = argv[1];
+    int port = atoi( argv[2] );
+
+    int ret = 0;
+    struct sockaddr_in address;
+    bzero( &address, sizeof( address ) );
+    address.sin_family = AF_INET;
+    inet_pton( AF_INET, ip, &address.sin_addr );
+    address.sin_port = htons( port );
+
+    listenfd = socket( PF_INET, SOCK_STREAM, 0 );
+    assert( listenfd >= 0 );
+
+    ret = bind( listenfd, ( struct sockaddr* )&address, sizeof( address ) );
+    assert( ret != -1 );
+
+    ret = listen( listenfd, 5 );
+    assert( ret != -1 );
+
+    user_count = 0;
+    users = new client_data [ USER_LIMIT+1 ];
+    sub_process = new int [ PROCESS_LIMIT ];
+    for( int i = 0; i < PROCESS_LIMIT; ++i )
+    {
+        sub_process[i] = -1;
+    }
+
+    epoll_event events[ MAX_EVENT_NUMBER ];
+    epollfd = epoll_create( 5 );
+    assert( epollfd != -1 );
+    addfd( epollfd, listenfd );
+
+    ret = socketpair( PF_UNIX, SOCK_STREAM, 0, sig_pipefd );
+    assert( ret != -1 );
+    setnonblocking( sig_pipefd[1] );
+    addfd( epollfd, sig_pipefd[0] );
+
+    addsig( SIGCHLD, sig_handler );
+    addsig( SIGTERM, sig_handler );
+    addsig( SIGINT, sig_handler );
+    addsig( SIGPIPE, SIG_IGN );
+    bool stop_server = false;
+    bool terminate = false;
+	/* 创建共享内存，作为所有客户socket 连接的读缓存 */
+    shmfd = shm_open( shm_name, O_CREAT | O_RDWR, 0666 );
+    assert( shmfd != -1 );
+    ret = ftruncate( shmfd, USER_LIMIT * BUFFER_SIZE ); 
+    assert( ret != -1 );
+
+    share_mem = (char*)mmap( NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0 );
+    assert( share_mem != MAP_FAILED );
+    close( shmfd );
+
+    while( !stop_server )
+    {
+        int number = epoll_wait( epollfd, events, MAX_EVENT_NUMBER, -1 );
+        if ( ( number < 0 ) && ( errno != EINTR ) )
+        {
+            printf( "epoll failure\n" );
+            break;
+        }
+
+        for ( int i = 0; i < number; i++ )
+        {
+            int sockfd = events[i].data.fd;
+            if( sockfd == listenfd )
+            {
+                struct sockaddr_in client_address;
+                socklen_t client_addrlength = sizeof( client_address );
+                int connfd = accept( listenfd, ( struct sockaddr* )&client_address, &client_addrlength );
+                if ( connfd < 0 )
+                {
+                    printf( "errno is: %d\n", errno );
+                    continue;
+                }
+                if( user_count >= USER_LIMIT )
+                {
+                    const char* info = "too many users\n";
+                    printf( "%s", info );
+                    send( connfd, info, strlen( info ), 0 );
+                    close( connfd );
+                    continue;
+                }
+				/* 保存第 user_count 个客户连接的相关数据*/
+                users[user_count].address = client_address;
+                users[user_count].connfd = connfd;
+				/* 在主进程和子进程间建立管道，以传递必要的数据 */
+                ret = socketpair( PF_UNIX, SOCK_STREAM, 0, users[user_count].pipefd );
+                assert( ret != -1 );
+                pid_t pid = fork();
+                if( pid < 0 )
+                {
+                    close( connfd );
+                    continue;
+                }
+                else if( pid == 0 )
+                {
+                    close( epollfd );
+                    close( listenfd );
+                    close( users[user_count].pipefd[0] );
+                    close( sig_pipefd[0] );
+                    close( sig_pipefd[1] );
+                    run_child( user_count, users, share_mem );
+                    munmap( (void*)share_mem,  USER_LIMIT * BUFFER_SIZE );
+                    exit( 0 );
+                }
+                else
+                {
+                    close( connfd );
+                    close( users[user_count].pipefd[1] );
+                    addfd( epollfd, users[user_count].pipefd[0] );
+                    users[user_count].pid = pid;
+					/*记录新的客户连接在数组 users 中的索引值，建立进程 pid和该索引值之间 的映射关系*/
+                    sub_process[pid] = user_count;
+                    user_count++;
+                }
+            }
+			/* 处理信号事件*/
+            else if( ( sockfd == sig_pipefd[0] ) && ( events[i].events & EPOLLIN ) )
+            {
+                int sig;
+                char signals[1024];
+                ret = recv( sig_pipefd[0], signals, sizeof( signals ), 0 );
+                if( ret == -1 )
+                {
+                    continue;
+                }
+                else if( ret == 0 )
+                {
+                    continue;
+                }
+                else
+                {
+                    for( int i = 0; i < ret; ++i )
+                    {
+                        switch( signals[i] )
+                        {
+							/* 子进程退出，表示有某个客户端关闭了连接 */
+                            case SIGCHLD:
+                            {
+	                        pid_t pid;
+	                        int stat;
+	                        while ( ( pid = waitpid( -1, &stat, WNOHANG ) ) > 0 )
+                                {
+									/* 用子进程的 pid取得被关闭的客户连接的编号 */
+                                    int del_user = sub_process[pid];
+                                    sub_process[pid] = -1;
+                                    if( ( del_user < 0 ) || ( del_user > USER_LIMIT ) )
+                                    {
+                                        printf( "the deleted user was not change\n" );
+                                        continue;
+                                    }
+									/* 清除第 del_user 个客户连接使用的相关数据 */
+                                    epoll_ctl( epollfd, EPOLL_CTL_DEL, users[del_user].pipefd[0], 0 );
+                                    close( users[del_user].pipefd[0] );
+                                    users[del_user] = users[--user_count];
+                                    sub_process[users[del_user].pid] = del_user;
+                                    printf( "child %d exit, now we have %d users\n", del_user, user_count ); 
+                                }
+                                if( terminate && user_count == 0 )
+                                {
+                                    stop_server = true;
+                                }
+                                break;
+                            }
+                            case SIGTERM:
+                            case SIGINT:
+                            {
+								/* 结束服务器程序*/
+                                printf( "kill all the clild now\n" );
+                                //addsig( SIGTERM, SIG_IGN );
+                                //addsig( SIGINT, SIG_IGN );
+                                if( user_count == 0 )
+                                {
+                                    stop_server = true;
+                                    break;
+                                }
+                                for( int i = 0; i < user_count; ++i )
+                                {
+                                    int pid = users[i].pid;
+                                    kill( pid, SIGTERM );
+                                }
+                                terminate = true;
+                                break;
+                            }
+                            default:
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+			/* 某个子进程向父进程写入了数据*/
+            else if( events[i].events & EPOLLIN )
+            {
+                int child = 0;
+				/* 读取管道数据，child变量记录了是哪个客户连接有数据到达 */
+                ret = recv( sockfd, ( char* )&child, sizeof( child ), 0 );
+                printf( "read data from child accross pipe\n" );
+                if( ret == -1 )
+                {
+                    continue;
+                }
+                else if( ret == 0 )
+                {
+                    continue;
+                }
+                else
+                {
+					/* 向除负责处理第 chlld个客户连接的子进程之外的其他子进程发送消息，通知它们有客户数据要写*/
+                    for( int j = 0; j < user_count; ++j )
+                    {
+                        if( users[j].pipefd[0] != sockfd )
+                        {
+                            printf( "send data to child accross pipe\n" );
+                            send( users[j].pipefd[0], ( char* )&child, sizeof( child ), 0 );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    del_resource();
+    return 0;
+}
+
+```
+
+虽然我们使用了共享内存，但每个子进程都只会往自己所处理的客户连接所对应的那一部分读缓存中写入数据，所以我们使用共享内存的目的只是为了“共享读”。因此,每个子进程在使用共享内存的时候都无须加锁。这样做符合“聊天室服务器”的应用场景，同时提高了程序性能。
+我们的服务器程序在启动的时候给数组users分配了足够多的空间，使得它可以存储
+所有可能的客户连接的相关数据。同样，我们一次性给数组sub_process分配的空间也足以存储所有可能的子进程的相关数据。这是牺牲空间换取时间的又一例子。
+
+
+
+
+
+### 7. 消息队列
+消息队列是在两个进程之间传递二进制块数据的一种简单有效的方式。每个数据块都有一个特定的类型，接收方可以根据类型来有选择地接收数据，而不一定像管道和命名管道那样必须以先进先出的方式接收数据。
+
+#### 7.1msgget系统调用
+msgget 系统调用创建一个消息队列，或者获取一个已有的消息队列。其定义如下∶
+
+```cpp
+#include <sys/msg.h>
+int msgget(key_t key, int msgflg);
+```
+msgflg参数的使用和含义与semget系统调用的sem_flags参数相同。
+msgget成功时返回一个正整数值，它是消息队列的标识符。msgget失败时返回-1，并设置errno。
+如果msgget用于创建消息队列，则与之关联的内核数据结构msqid_ds将被创建并初始化。msqid_ds 结构体的定义如下:
+```cpp
+struct msqid_ds
+{
+	struct ipc_perm msg_perm;				/* 消息队列的操作权限 */
+	time_t msg_stime;						/* 最后一次调用msgsnd的时间 */
+	time_t msg_rtime;						/* 最后一次调用msgrcv的时间*/
+	time_t msg_ctime;						/* 最后一次被修改的时间 */ 
+	unsigned long _msg_cbytes;				/* 消息队列中已有的字节数*/ 
+	msgqnum_t msg_qnum;						/* 消息队列中已有的消息数 */ 
+	msglen_t msg_qbytes;					/* 消息队列允许的最大字节数 */ 
+	pid_t msg_1spid;						/* 最后执行msgsnd的进程的PID*/
+	pid_t msg_lrpid;						/* 最后执行msgrcv的进程的 PID*/
+};
+```
+
+
+#### 7.2 msgsnd系统调用
+msgsnd 系统调用把一条消息添加到消息队列中。其定义如下∶
+```cpp
+#include <sys/msg.h>
+int msgsnd(int msgqid, const void* msg_ptr, size_t msg_sz, int msgflg);
+```
+msqid 参数是由 msgget 调用返回的消息队列标识符。
+msg_ptr 参数指向一个准备发送的消息，消息必须被定义为如下类型∶
+```cpp
+struct msgbuf
+{
+	long mytype;		/* 消息类型 */
+	char mtext[512];	/* 消息数据 */
+};
+```
+其中，mtype成员指定消息的类型，它必须是一个正整数。mtext是消息数据。msg_sz参数是消息的数据部分(mtext）的长度。这个长度可以为0，表示没有消息数据。
+msgflg参数控制msgsnd的行为。它通常仅支持IPC_NOWAIT标志，即以非阻塞的方式发送消息。默认情况下，发送消息时如果消息队列满了，则msgsnd将阻塞。若IPCNOWAIT标志被指定，则msgsnd将立即返回并设置errno为EAGAIN。
+处于阻塞状态的msgsnd调用可能被如下两种异常情况所中断:
+- 消息队列被移除。此时msgsnd调用将立即返回并设置errno为EIDRM。
+- 程序接收到信号。此时msgsnd调用将立即返回并设置errno 为EINTR。
+msgsnd成功时返回0，失败则返回-1并设置errno。msgsnd成功时将修改内核数据结构msqid_ds 的部分字段，如下所示:
+- 将msg_qnum加1。
+- 将msg_lspid设置为调用进程的PID。
+- 将msg_stime设置为当前的时间。
+
+
+
+#### 7.3 msgrcv系统调用
+msgrcv系统调用从消息队列中获取消息。其定义如下∶
+```cpp
+#include <sys/msg.h>
+int msgrcv(int msgqid, void* msg_ptr, size_t msh_sz, long int msgtype, int msgflg);
+```
+msqid参数是由msgget 调用返回的消息队列标识符。
+msg_ptr参数用于存储接收的消息，msg_sz参数指的是消息数据部分的长度。
+msgtype参数指定接收何种类型的消息。我们可以使用如下几种方式来指定消息类型:
+- msgtype等于0。读取消息队列中的第一个消息。
+- msgtype大于0。读取消息队列中第一个类型为msgtype的消息（除非指定了标志MSG_EXCEPT，见后文)。
+- msgtype小于0。读取消息队列中第一个类型值比 msgtype 的绝对值小的消息。
+
+
+参数msgflg 控制msgrcv函数的行为。它可以是如下一些标志的按位或:
+- IPC_NOWAIT。如果消息队列中没有消息，则msgrcv调用立即返回并设置errno为ENOMSG。
+- MSG_EXCEPT。如果msgtype大于0，则接收消息队列中第一个非msgtype类型的消息。
+- MSG_NOERROR。如果消息数据部分的长度超过了msg_sz，就将它截断。
+
+
+处于阻塞状态的msgrcv调用还可能被如下两种异常情况所中断:
+- 消息队列被移除。此时msgrcv调用将立即返回并设置errno为EIDRM。
+- 程序接收到信号。此时msgrcv调用将立即返回并设置errno为 EINTR。
+
+
+msgrcv成功时返回0，失败则返回-1并设置errno。msgrcv成功时将修改内核数据结构msqid_ds 的部分字段，如下所示:
+- 将msg_qnum减1。
+- 将msg_lrpid设置为调用进程的PID.
+- 将msg_rtime设置为当前的时间。
+
+
+
+#### 7.4 msgctl系统调用
+sgctl 系统调用控制消息队列的某些属性。其定义如下∶
+```cpp
+#include <sys/msg.h>
+int msgctl(int msgqid, int command, struct msqid_ds* buf);
+```
+msqid参数是由 msgget 调用返回的共享内存标识符。command 参数指定要执行的命令。
+msgctl 支持的所有命令如表所示。
+
+
+<div align="center" style="font-weight:900;font-size:larger">
+msgctl支持的命令
+</div>
+<div align="center">
+	<table align="center">
+		<tr align="center" style="font-weight:700;font-size:large">
+			<td>command</td>
+			<td>含义</td>
+			<td>成功时的返回值</td>
+		</tr>
+		<tr>
+			<td>IPC_STAT</td>
+			<td>将消息队列关联的内核数据结构复制到 buf()第3个参数，下同)中</td>
+			<td>0</td>
+		</tr>
+		<tr>
+			<td>IPC_SET</td>
+			<td>将 buf 中的部分成员复制到消息队列关联的内核数据结构中，同时内核数据中的msqid_ds.msg_ctime被更新</td>
+			<td>0</td>
+		</tr>
+		<tr>
+			<td>IPC_RMID</td>
+			<td>立即移除消息队列，唤醒所有等待读消息和写消息的进程（这些调用立即返回并设置crrno 为 EIDRM)</td>
+			<td>0</td>
+		</tr>
+		<tr>
+			<td>IPC_INFO</td>
+			<td>获取系统消息队列资源配置信息，将结果存储在buf中。应用程序需要将buf转换成msginfo结构体类型来读取这些系统信息。msginfo结构体与seminfo类似，这里不再赘述</td>
+			<td>内核消息队列信息数组中已经被使用的项的最大索引值</td>
+		</tr>
+		<tr>
+			<td>MSG_INFO</td>
+			<td>与IPC_INFO类似，不过返回的是已经分配的消息队列占用的资源信息</td>
+			<td>同IPC_INFO</td>
+		</tr>
+		<tr>
+			<td>MSG_STAT</td>
+			<td>与IPC_STAT类似，不过此时msqid参数不是用来表示消息队列标识符,而是内核消息队列信息数组的索引〈每个消息队列的信息都是该数组中的一项)</td>
+			<td>内核消息队列信息数组中 MSG_STAT 识符，而是内核消息队列数组中索引值为msqid 的消息队列的标识符</td>
+		</tr>
+	</table>
+</div>
+
+
+
+
+
+### 8. IPC命令
+
+
+
+### 9.在进程之间传递文件描述符
+由于fork调用之后，父进程中打开的文件描述符在子进程中仍然保持打开，所以文件描述符可以很方便地从父进程传递到子进程。需要注意的是，传递一-个文件描述符并不是传递一个文件描述符的值，而是要在接收进程中创建-一个新的文件描述符，并且该文件描述符和发送进程中被传递的文件描述符指向内核中相同的文件表项。
+
+```cpp
+
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <string.h>
+
+static const int CONTROL_LEN = CMSG_LEN( sizeof(int) );
+
+/* 发送文件描述符，fd参数是用来传递信息的 UNIX域socket，fd_to send参数是待发送的文件播述符 */
+void send_fd( int fd, int fd_to_send )
+{
+    struct iovec iov[1];
+    struct msghdr msg;
+    char buf[0];
+
+    iov[0].iov_base = buf;
+    iov[0].iov_len = 1;
+    msg.msg_name    = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov     = iov;
+    msg.msg_iovlen = 1;
+
+    cmsghdr cm;
+    cm.cmsg_len = CONTROL_LEN;
+    cm.cmsg_level = SOL_SOCKET;
+    cm.cmsg_type = SCM_RIGHTS;
+    *(int *)CMSG_DATA( &cm ) = fd_to_send;
+    msg.msg_control = &cm;
+    msg.msg_controllen = CONTROL_LEN;
+
+    sendmsg( fd, &msg, 0 );
+}
+
+/* 接收目标文件描述符 */
+int recv_fd( int fd )
+{
+    struct iovec iov[1];
+    struct msghdr msg;
+    char buf[0];
+
+    iov[0].iov_base = buf;
+    iov[0].iov_len = 1;
+    msg.msg_name    = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov     = iov;
+    msg.msg_iovlen = 1;
+
+    cmsghdr cm;
+    msg.msg_control = &cm;
+    msg.msg_controllen = CONTROL_LEN;
+
+    recvmsg( fd, &msg, 0 );
+
+    int fd_to_read = *(int *)CMSG_DATA( &cm );
+    return fd_to_read;
+}
+
+int main()
+{
+    int pipefd[2];
+    int fd_to_pass = 0;
+
+	/* 创建父、子进程间的管道，文件描述符pipefd【0】和pipefd【1】都是UNIx域socket */
+    int ret = socketpair( PF_UNIX, SOCK_DGRAM, 0, pipefd );
+    assert( ret != -1 );
+
+    pid_t pid = fork();
+    assert( pid >= 0 );
+
+    if ( pid == 0 )
+    {
+        close( pipefd[0] );
+        fd_to_pass = open( "test.txt", O_RDWR, 0666 );
+		/* 子进程通过管道将文件描述符发送到父进程。如果文件 test，txt 打开失败，则子进程将标 准输入文件描述符发送到父进程 */
+        send_fd( pipefd[1], ( fd_to_pass > 0 ) ? fd_to_pass : 0 );
+        close( fd_to_pass );
+        exit( 0 );
+    }
+
+    close( pipefd[1] );
+    fd_to_pass = recv_fd( pipefd[0] );	/* 父进程从管道接收目标文件猫述符*/
+    char buf[1024];
+    memset( buf, '\0', 1024 );
+    read( fd_to_pass, buf, 1024 );
+    printf( "I got fd %d and data %s\n", fd_to_pass, buf );
+    close( fd_to_pass );
+}
+```
+
+
+
+
+
+
+
+## 多线程编程
+
+### 1. Linux线程概述、
+#### 1.1 线程模型
+
