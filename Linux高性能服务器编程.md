@@ -6395,7 +6395,7 @@ struct eventop {
 
 
 
-## 多线程编成
+## 多进程编程
 
 ### 1. fork系统调用
 Linux 下创建新进程的系统调用是 fork。其定义如下;
@@ -7500,4 +7500,1084 @@ int main()
 
 ### 1. Linux线程概述、
 #### 1.1 线程模型
+==线程是程序中完成一个独立任务的完整执行序列，即一个可调度的实体。根据运行环境和调度者的身份，线程可分为内核线程和用户线程。内核线程，在有的系统上也称为LWP(Light weight Process，轻量级进程)，运行在内核空间，由内核来调度﹔用户线程运行在用户空间，由线程库来调度。当进程的一个内核线程获得CPU的使用权时，它就加载并运行一个用户线程。可见，内核线程相当于用户线程运行的“容器”。**一个进程可以拥有M个内核线程和N个用户线程，其中M≤N。并且在一个系统的所有进程中，M和N的比值都是固定的。按照M:N的取值，线程的实现方式可分为三种模式:完全在用户空间实现、完全由内核调度和双层调度(two level scheduler)。**==
+完全在用户空间实现的线程无须内核的支持，内核甚至根本不知道这些线程的存在。线程库负责管理所有执行线程，比如线程的优先级、时间片等。线程库利用longjmp来切换线程的执行，使它们看起来像是“并发”执行的。但实际上内核仍然是把整个进程作为最小单位来调度的。换句话说，一个进程的所有执行线程共享该进程的时间片，它们对外表现出相同的优先级。因此，对这种实现方式而言，N=1，即M个用户空间线程对应1个内核线程，而该内核线程实际上就是进程本身。==完全在用户空间实现的线程的优点是:创建和调度线程都无须内核的干预，因此速度相当快。并且由于它不占用额外的内核资源，所以即使一个进程创建了很多线程，也不会对系统性能造成明显的影响。其缺点是﹔对于多处理器系统，一个进程的多个线程无法运行在不同的CPU上，因为内核是按照其最小调度单位来分配CPU的。此外，线程的优先级只对同一个进程中的线程有效，比较不同进程中的线程的优先级没有意义。==
+
+完全由内核调度的模式将创建、调度线程的任务都交给了内核，运行在用户空间的线程库无须执行管理任务，这与完全在用户空间实现的线程恰恰相反。二者的优缺点也正好互换。较早的 Linux内核对内核线程的控制能力有限，线程库通常还要提供额外的控制能力,尤其是线程同步机制，不过现代Linux内核已经大大增强了对线程的支持。完全由内核调度的这种线程实现方式满足M:N=1:1，即1个用户空间线程被映射为1个内核线程。
+双层调度模式是前两种实现模式的混合体:内核调度M个内核线程，线程库调度N个用户线程。这种线程实现方式结合了前两种方式的优点:不但不会消耗过多的内核资源，而且线程切换速度也较快，同时它可以充分利用多处理器的优势。
+
+#### 1.2 Linux线程库
+
+> 查看当前系统上所使用的线程库：getconf GNU_LIBPTHREAD_VERSIO
+
+LinuxThreads线程库的内核线程是用clone系统调用创建的进程模拟的。clone系统调用和fork系统调用的作用类似：创建调用进程的子进程。不过我们可以为clone系统调用指定CLONE_THREAD标志，这种情况下它创建的子进程与调用进程共享相同的虚拟地址空间、文件描述符和信号处理函数，这些都是线程的特点。不过，用进程来模拟内核线程会导致很多语义问题，比如:
+- 每个线程拥有不同的PID，因此不符合POSIX规范。
+- Linux信号处理本来是基于进程的，但现在一个进程内部的所有线程都能而且必须处理信号。
+- 用户ID、组ID对一个进程中的不同线程来说可能是不-样的。
+- 程序产生的核心转储文件不会包含所有线程的信息，而只包含产生该核心转储文件的线程的信息。
+- 由于每个线程都是一个进程，因此系统允许的最大进程数也就是最大线程数。
+
+
+LinuxThreads 线程库一个有名的特性是所谓的管理线程。它是进程中专门用于管理其他工作线程的线程。其作用包括∶
+- 系统发送给进程的终止信号先由管理线程接收，管理线程再给其他工作线程发送同样的信号以终止它们。
+- 当终止工作线程或者工作线程主动退出时，管理线程必须等待它们结束，以避免僵尸进程。
+- 如果主线程先于其他工作线程退出，则管理线程将阻塞它，直到所有其他工作线程都结束之后才唤醒它。
+- 回收每个线程堆栈使用的内存。
+
+
+==相比 LinuxThreads，NPTL 的主要优势在于∶==
+- 内核线程不再是一个进程，因此避免了很多用进程模拟内核线程导致的语义问题。
+- 摒弃了管理线程，终止线程、回收线程堆栈等工作都可以由内核来完成。
+- 由于不存在管理线程，所以一个进程的线程可以运行在不同的CPU上，从而充分利用了多处理器系统的优势。
+- 线程的同步由内核来完成。隶属于不同进程的线程之间也能共享互斥锁，因此可实现跨进程的线程同步。
+
+
+### 2. 创建线程和结束线程
+
+1. pthread_create
+创建一个线程的函数是 pthread_create。其定义如下∶
+```cpp
+#include <pthread.h>
+int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start_routine)(void*), void* arg);
+```
+thread参数是新线程的标识符，后续 pthread_*函数通过它来引用新线程。其类型pthread_t 的定义如下∶
+
+```cpp
+#include <bits/pthreadtypes.h>
+typedef unsigned long int pthread_t;
+```
+可见，pthread_t 是一个整型类型。实际上，Linux 上几乎所有的资源标识符都是一个整型数，比如 socket、各种 System VIPC 标识符等。
+ttr 参数用于设置新线程的属性。给它传递 NULL 表示使用默认线程属性。线程拥有众多属性，我们将在后面详细讨论之。
+start routine 和 arg参数分别指定新线程将运行的函数及其参数。
+pthread_create 成功时返回 0，失败时返回错误码。一个用户可以打开的线程数量不能超
+过 RLIMIT NPROC软资源限制。此外，系统上所有用户能创建的线程总数也不得超过 /proc/sys/kernel/threads-max 内核参数所定义的值。
+
+2. pthread_exit
+线程一旦被创建好，内核就可以调度内核线程来执行 start_routine 函数指针所指向的函数了。线程函数在结束时最好调用如下函数，以确保安全、干净地退出∶
+```cpp
+#include <pthread.h>
+void pthread_exit(void* retval);
+```
+pthread exit 函数通过 retval 参数向线程的回收者传递其退出信息。它执行完之后不会返回到调用者，而且永远不会失败。
+
+3. pthread_join
+一个进程中的所有线程都可以调用 pthread join 函数来回收其他线程（前提是目标线程是可回收的，见后文），即等待其他线程结束，这类似于回收进程的 wait 和 waitpid系统调用。pthread_join的定义如下∶
+```cpp
+#include <pthread.h>
+int pthread_join(pthread_t thread, void** retval);
+```
+thread参数是目标线程的标识符，retval参数则是目标线程返回的退出信息。该函数会一直阻塞，直到被回收的线程结束为止。该函数成功时返回0，失败则返回错误码。可能的错误码如表所示。
+
+<div align="center" style="font-weight:900;font-size:larger">
+pthread_join函数可能引发的错误码
+</div>
+<div align="center">
+	<table align="center">
+		<tr align="center" style="font-weight:700;font-size:large">
+			<td>错误码</td>
+			<td>描述</td>
+		</tr>
+		<tr>
+			<td>EDEADLK</td>
+			<td>可能引起死锁。比如两个线程互相针对对方调用pthread _join，或者线程对自身调用pthread_join</td>
+		</tr>
+		<tr>
+			<td>EINAVAL</td>
+			<td>目标线程是不可回收的，或者已经有其他线程在回收该目标线程</td>
+		</tr>
+		<tr>
+			<td>ESRCH</td>
+			<td>目标线程不存在</td>
+		</tr>
+	</table>
+</div>
+
+4. pthrad_cancel
+有时候我们希望异常终止一个线程，即取消线程，它是通过如下函数实现的∶
+```cpp
+#include <pthread.h>
+int pthread_cancel(pthread_t thread);
+```
+thread参数是目标线程的标识符。该函数成功时返回 0，失败则返回错误码。不过，接收到取消请求的目标线程可以决定是否允许被取消以及如何取消，这分别由如下两个函数完成∶
+```cpp
+#include <pthread.h>
+int pthread_setcancelstate(int state, int* oldstate);
+int pthread_setcanceltype(int type, int* oldtype);
+```
+这两个函数的第一个参数分别用于设置线程的取消状态（是否允许取消）和取消类型(如何取消)，第二个参数则分别记录线程原来的取消状态和取消类型。
+
+state参数有两个可选值:
+- PTHREAD_CANCEL_ENABLE，允许线程被取消。它是线程被创建时的默认取消状态。
+- PTHREAD_CANCEL_DISABLE，禁止线程被取消。这种情况下，如果一个线程收到取消请求,则它会将请求挂起，直到该线程允许被取消。
+
+
+type参数也有两个可选值:
+- PTHREAD_CANCEL_ASYNCHRONOUS，线程随时都可以被取消。它将使得接收到取消请求的目标线程立即采取行动。
+- PTHREAD_CANCEL_DEFERRED，允许目标线程推迟行动，直到它调用了下面几个所谓的取消点函数中的一个: pthread_join、pthread_testcancel、pthread_cond_wait、pthread_cond_timedwait、sem_wait和 sigwait。根据POSIX标准，其他可能阻塞的系统调用，比如read、wait，也可以成为取消点。不过为了安全起见，我们最好在可能会被取消的代码中调用pthread_testcancel函数以设置取消点。
+
+
+pthread_setcancelstate和 pthread_setcanceltype成功时返回0，失败则返回错误码。
+
+
+### 3.线程属性
+pthread_attr_t结构体定义了一套完整的线程属性，如下所示：
+```cpp
+#include <bits/pthreadtypes.h>
+#define __SIZEOF_PTHREAD_ATTR_T 36
+typedef union
+{
+	char __size[__SIZEOF_PTHREAD_ATTR_T];
+	long int __align;
+}pthread_attr_t;
+```
+可见，各种线程属性全部包含在一个字符数组中。线程库定义了一系列函数来操作pthread_attr_t 类型的变量，以方便我们获取和设置线程属性。这些函数包括∶
+```cpp
+#include <pthread.h>
+/* 初始化线程属性对象 */
+int pthread_attr_init(pthread_attr_t* attr);
+/* 销毁线程属性对象，被销毁的线程属性对象只有再次初始化之后才能被继续使用 */
+int pthread_attr_destroy(pthread_attr_t* attr);
+/* 下面这些函数用于获取和设置线程属性对象的某个属性*/
+int pthread_attr_getdetachstate(const pthread_attr_t* attr, int* detachstate);
+int pthread_attr_setdetachstate(pthread_attr_t* attr, int detachstate);
+int pthread_attr_getstackaddr (const pthread_attr_t* attr,void ** stackaddr );
+int pthread_attr_setstackaddr ( pthread_attr_t* attr，void* stackaddr );
+int pthread_attr_getstacksize ( const pthread_attr_t* attr，size_t* stacksize );
+int pthread_attr_setstacksize ( pthread_attr_t* attr, size_t stacksize);
+int pthread_attr_getstack ( const pthread_attr_t* attr，void** stackaddr,size_t* stacksize) ;
+int pthread_attr_setstack(pthread_attr_t* attr,void* stackaddr,size_t stacksize);
+int pthread_attr_getquardsize ( const pthread_attr_t *_attr,size_t* guardsize);
+int pthread_attr_setguardsize (pthread attr_t* attr,size_t guardsize );
+int pthread_attr_getschedparam ( const pthread_attr_t* attr,struct sched_param* param );
+int pthread_attr_setschedparam ( pthread_attr_t* attr,const struct sched_param* param );
+int pthread_attr_getschedpolicy ( const pthread_attr_t* attr，int* policy );
+int pthread_attr_setschedpolicy ( pthread_attr_t* attr,int policy );
+int pthread_attr_getinheritsched ( const pthread_attr_t* attr，int* inherit);
+int pthread_attr_setinheritsched (pthread_attr_t* attr, int inherit );
+int pthread_attr_getscope ( const pthread_attr_t* attr. int* scope );
+int pthread_attr_setscope ( pthread_attr_t* attr, int scope );
+```
+每个线程属性的含义∶
+- detachstate，线程的脱离状态。它有PTHREAD_CREATE_JOINABLE和 PTHREAD_CREATE_DETACH两个可选值。前者指定线程是可以被回收的，后者使调用线程脱离与进程中其他线程的同步。脱离了与其他线程同步的线程称为“脱离线程”。脱离线程在退出时将自行释放其占用的系统资源。线程创建时该属性的默认值是PTHREAD_CREATE_JOINABLE。此外，我们也可以使用pthread_detach函数直接将线程设置为脱离线程。
+- stackaddr和 stacksize，线程堆栈的起始地址和大小。一般来说，我们不需要自己来管理线程堆栈，因为Linux默认为每个线程分配了足够的堆栈空间（一般是8 MB)。我们可以使用ulimt -s命令来查看或修改这个默认值。
+- guardsize，保护区域大小。如果guardsize大于0，则系统创建线程的时候会在其堆栈的尾部额外分配guardsize字节的空间，作为保护堆栈不被错误地覆盖的区域。如果guardsize等于0，则系统不为新创建的线程设置堆栈保护区。如果使用者通过pthread_attr_setstackaddr或pthread_attr_setstack 函数手动设置线程的堆栈，则guardsize属性将被忽略。
+- schedparam，线程调度参数。其类型是sched_param结构体。该结构体目前还只有一个整型类型的成员——sched_priority，该成员表示线程的运行优先级。
+- schedpolicy，线程调度策略。该属性有SCHED_FIFO、SCHED_RR和SCHED_OTHER三个可选值，其中SCHED_OTHER是默认值。SCHED_RR表示采用轮转算法（round-robin）调度，SCHED_FIFO表示使用先进先出的方法调度，这两种调度方法都具备实时调度功能，但只能用于以超级用户身份运行的进程。
+- inheritsched，是否继承调用线程的调度属性。该属性有PTHREAD_INHERIT_SCHED和PTHREAD_EXPLICIT_SCHED两个可选值。前者表示新线程沿用其创建者的线程调度参数，这种情况下再设置新线程的调度参数属性将没有任何效果。后者表示调用者要明确地指定新线程的调度参数。
+- scope，线程间竞争CPU的范围，即线程优先级的有效范围。POSIX标准定义了该属性的PTHREAD_SCOPE_sYSTEM和PTHREAD_SCOPE_PROCESS两个可选值，前者表示目标线程与系统中所有线程-起竞争CPU的使用，后者表示目标线程仅与其他隶属于同一进程的线程竞争CPU的使用。目前Linux 只支持PTHREAD_SCOPE_sYSTEM这一种取值。
+
+
+
+### 4. POSIX信号量
+常用的 POSIX信号量函数是下面5 个∶
+```cpp
+#include <semaphore.h>
+int sem_init(sem_t* sem, int pshared, unsigned int value);
+int sem_destroy(sem_t* sem);
+int sem_wait(sem_t* sem);
+int sem_trywait(sem_t* sem);
+int sem_post(sem_t* sem);
+```
+这些函数的第一个参数 sem 指向被操作的信号量。
+sem_init函数用于初始化一个未命名的信号量。pshared参数指定信号量的类型。如果其值为0，就表示这个信号量是当前进程的局部信号量，否则该信号量就可以在多个进程之间共享。value参数指定信号量的初始值。==此外，初始化一个已经被初始化的信号量将导致不可预期的结果。==
+sem_destroy函数用于销毁信号量，以释放其占用的内核资源。==如果销毁一个正被其他线程等待的信号量，则将导致不可预期的结果。==
+sem_wait 函数以原子操作的方式将信号量的值减1。如果信号量的值为0，则sem_wait将被阻塞，直到这个信号量具有非0值。
+sem_trywait 与sem_wait函数相似，不过它始终立即返回，而不论被操作的信号量是否具有非0值，相当于sem_wait 的非阻塞版本。当信号量的值非0时，sem_trywait对信号量执行减1操作。当信号量的值为0时，它将返回-1并设置errno为EAGAIN.
+sem_post函数以原子操作的方式将信号量的值加1。当信号量的值大于0时，其他正在调用sem_wait等待信号量的线程将被唤醒。
+上面这些函数成功时返回0，失败则返回-1并设置errno。
+
+
+### 5. 互斥锁
+互斥锁（也称互斥量）可以用于保护关键代码段，以确保其独占式的访问，这有点像-个二进制信号量。当进人关键代码段时，我们需要获得互斥锁并将其加锁,这等价于二进制信号量的Р操作﹔当离开关键代码段时，我们需要对互斥锁解锁，以唤醒其他等待该互斥锁的线程，这等价于二进制信号量的V操作。
+
+#### 5.1 互斥锁基础API
+POSIX 互斥锁的相关函数主要有如下 5 个∶
+```cpp
+#include <pthread.h>
+int pthread_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* mutexattr);
+int pthread_mutex_destroy( pthread_mutex_t*mutex );
+int pthread_mutex_lock ( pthread_mutex_t* mutex );
+int pthread_mutex_trylocki pthread_mutex_t* mutex );
+int pthread_mutex_unlock( pthread_mutex_t* mutex );
+```
+这些函数的第一个参数 mutex 指向要操作的目标互斥锁，互斥锁的类型是 pthread_mutex_t 结构体。
+pthread_mutex_init函数用于初始化互斥锁。mutexattr参数指定互斥锁的属性。如果将它设置为NULL，则表示使用默认属性。我们将在下一小节讨论互斥锁的属性。除了这个函数外，我们还可以使用如下方式来初始化一个互斥锁:
+```cpp
+pthread_mutex_t mutex = PTHREAD_MUTEX_INTTIALIZER;
+```
+宏 PTHREAD_MUTEX_INITIALIZER 实际上只是把互斥锁的各个字段都初始化为 0。
+pthread_mutex_destroy函数用于销毁互斥锁，以释放其占用的内核资源。==销毁一个已经加锁的互斥锁将导致不可预期的后果。==
+pthread_mutex_lock函数以原子操作的方式给一个互斥锁加锁。如果目标互斥锁已经被锁上，则pthread_mutex_lock调用将阻塞，直到该互斥锁的占有者将其解锁。
+pthread_mutex_trylock 与pthread_mutex_lock函数类似，不过它始终立即返回，而不论被操作的互斥锁是否已经被加锁，相当于pthread_mutex_lock的非阻塞版本。当目标互斥锁未被加锁时,pthread_mutex_trylock对互斥锁执行加锁操作。当互斥锁已经被加锁时，pthread_mutex_trylock将返回错误码EBUSY。需要注意的是，这里讨论的pthread_mutex_lock 和 pthread_mutex_trylock 的行为是针对普通锁而言的。后面我们将看到，对于其他类型的锁而言，这两个加锁函数会有不同的行为。
+pthread_mutex_unlock 函数以原子操作的方式给一个互斥锁解锁。如果此时有其他线程正在等待这个互斥锁，则这些线程中的某一个将获得它。
+上面这些函数成功时返回0，失败则返回错误码。
+
+#### 5.2 互斥锁属性
+pthread_mutexattr_t结构体定义了一套完整的互斥锁属性。线程库提供了一系列函数来操作pthread_mutexattr_t类型的变量，以方便我们获取和设置互斥锁属性。这里我们列出其中一些主要的函数:
+```cpp
+#include <pthread .h>
+/*初始化互斥锁属性对象*/
+int pthread_mutexattr_init ( pthread_mutexattr_t* attr );
+/*销毁互斥锁属性对象*/
+int pthread_mutexattr_destroy( pthread_mutexattr_t* attr );
+/*获取和设置互斥锁的pshared属性*/
+int pthread_mutexattr_getpshared( const pthread_mutexattr_t* attr，int* pshared );
+int pthread_mutexattr_setpshared ( pthread_mutexattr_t* attr， int pshared );
+/*获取和设置互斥锁的type 属性*/
+int pthread_mutexattr_gettype( const pthread_mutexattr_t* attr，int* type);
+int pthread_mutexattr_settype ( pthread_mutexattr_t* attr, int type );
+```
+互斥锁属性 pshared指定是否允许跨进程共享互斥锁，其可选值有两个∶
+- PTHREAD_PROCESS_SHARED。互斥锁可以被跨进程共享。
+- PTHREAD_PROCESS_PRIVATE。互斥锁只能被和锁的初始化线程隶属于同一个进程的线程共享。
+
+
+互斥锁属性type指定互斥锁的类型。Linux支持如下4种类型的互斥锁:
+- PTHREAD_MUTEX_NORMAL，普通锁。这是互斥锁默认的类型。当一个线程对一个普通锁加锁以后，其余请求该锁的线程将形成一个等待队列，并在该锁解锁后按优先级获得它。这种锁类型保证了资源分配的公平性。==但这种锁也很容易引发问题:一个线程如果对一个已经加锁的普通锁再次加锁，将引发死锁﹔**对一个已经被其他线程加锁的普通锁解锁，或者对一个已经解锁的普通锁再次解锁，将导致不可预期的后果。**==
+- PTHREAD_MUTEX_ERRORCHECK，检错锁。一个线程如果对一个已经加锁的检错锁再次加锁，则加锁操作返回EDEADLK。对一个已经被其他线程加锁的检错锁解锁，或者对一个已经解锁的检错锁再次解锁，则解锁操作返回EPERM。
+- PTHREAD_MUTEX_RECURSIVE，嵌套锁。这种锁允许一个线程在释放锁之前多次对它加锁而不发生死锁。不过其他线程如果要获得这个锁，则当前锁的拥有者必须执行相应次数的解锁操作。对一个已经被其他线程加锁的嵌套锁解锁，或者对一个已经解锁的嵌套锁再次解锁，则解锁操作返回EPERM。
+- PTHREAD_MUTEX_DEFAULT，默认锁。==一个线程如果对一个已经加锁的默认锁再次加锁，或者对一个已经被其他线程加锁的默认锁解锁，或者对一个已经解锁的默认锁再次解锁，将导致不可预期的后果。==这种锁在实现的时候可能被映射为上面三种锁之一。
+
+
+#### 5.3 死锁举例
+
+```cpp
+#include <pthread.h>
+#include <unistd.h>
+#include <stdio.h>
+
+int a = 0;
+int b = 0;
+pthread_mutex_t mutex_a;
+pthread_mutex_t mutex_b;
+
+void* another( void* arg )
+{
+    pthread_mutex_lock( &mutex_b );
+    printf( "in child thread, got mutex b, waiting for mutex a\n" );
+    sleep( 5 );
+    ++b;
+    pthread_mutex_lock( &mutex_a );
+    b += a++;
+    pthread_mutex_unlock( &mutex_a );
+    pthread_mutex_unlock( &mutex_b );
+    pthread_exit( NULL );
+}
+
+int main()
+{
+    pthread_t id;
+    
+    pthread_mutex_init( &mutex_a, NULL );
+    pthread_mutex_init( &mutex_b, NULL );
+    pthread_create( &id, NULL, another, NULL );
+
+    pthread_mutex_lock( &mutex_a );
+    printf( "in parent thread, got mutex a, waiting for mutex b\n" );
+    sleep( 5 );
+    ++a;
+    pthread_mutex_lock( &mutex_b );
+    a += b++;
+    pthread_mutex_unlock( &mutex_b );
+    pthread_mutex_unlock( &mutex_a );
+
+    pthread_join( id, NULL );
+    pthread_mutex_destroy( &mutex_a );
+    pthread_mutex_destroy( &mutex_b );
+    return 0;
+}
+```
+
+
+
+
+### 6. 条件变量
+如果说互斥锁是用于同步线程对共享数据的访问的话，那么条件变量则是用于在线程之间同步共享数据的值。条件变量提供了一种线程间的通知机制∶当某个共享数据达到某个值的时候，唤醒等待这个共享数据的线程。
+条件变量的相关函数主要有如下5个∶
+```cpp
+#include <pthread.h>
+int pthread_cond_init( pthread_cond_t* cond,const pthread_condattr_t* cond_attr);
+int pthread_cond_destroy ( pthread_cond_t* cond);
+int pthread_cond_broadcast ( pthread_cond_t* cond );
+int pthread_cond_signal( pthread_cond_t* cond );
+int pthread_cond_wait(pthread_cond_t*cond,pthread_mutex_t*mutex );
+```
+这些函数的第一个参数 cond 指向要操作的目标条件变量，条件变量的类型是 pthread_cond_t 结构体。
+pthread_cond_init函数用于初始化条件变量。cond_attr参数指定条件变量的属性。如果将它设置为NULL，则表示使用默认属性。条件变量的属性不多，而且和互斥锁的属性类型相似，所以我们不再赘述。除了pthread_cond_init函数外，我们还可以使用如下方式来初始化一个条件变量:
+```cpp
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+```
+宏PTHREAD_COND_INITIALIZER实际上只是把条件变量的各个字段都初始化为0。
+pthread_cond_destroy函数用于销毁条件变量，以释放其占用的内核资源。销毁一个正在被等待的条件变量将失败并返回EBUSY。
+pthread_cond_broadcast函数以广播的方式唤醒所有等待目标条件变量的线程。
+pthread_cond_signal 函数用于唤醒一个等待目标条件变量的线程。至于哪个线程将被唤醒，则取决于线程的优先级和调度策略。有时候我们可能想唤醒一个指定的线程，但pthread没有对该需求提供解决方法。不过我们可以间接地实现该需求:==定义一个能够唯一表示目标线程的全局变量，在唤醒等待条件变量的线程前先设置该变量为目标线程，然后采用广播方式唤醒所有等待条件变量的线程，这些线程被唤醒后都检查该变量以判断被唤醒的是否是自己，如果是就开始执行后续代码，如果不是则返回继续等待。==
+pthread_cond_wait函数用于等待目标条件变量。mutex参数是用于保护条件变量的互斥锁，以确保pthread_cond_wait操作的原子性。在调用pthread_cond_wait前，必须确保互斥锁mutex已经加锁，否则将导致不可预期的结果。pthread_cond_wait 函数执行时，首先把调用线程放入条件变量的等待队列中，然后将互斥锁mutex解锁。可见，从 pthread_cond_wait开始执行到其调用线程被放入条件变量的等待队列之间的这段时间内，pthread_cond_signal和pthread_cond_broadcast等函数不会修改条件变量。换言之，pthread_cond_wait 函数不会错过目标条件变量的任何变化”。当pthread_cond_wait 函数成功返回时，互斥锁mutex将再次被锁上。
+上面这些函数成功时返回0，失败则返回错误码。
+
+
+
+### 7. 线程同步包装类
+<div align="center" style="font-size;larger;font-weight:900">locker.h</div>
+```cpp
+#ifndef LOCKER_H
+#define LOCKER_H
+
+#include <exception>
+#include <pthread.h>
+#include <semaphore.h>
+
+/* 封装信号量类 */
+class sem
+{
+public:
+	/* 创建并初始化信号量 */
+    sem()
+    {
+        if( sem_init( &m_sem, 0, 0 ) != 0 )
+        {
+            throw std::exception();
+        }
+    }
+	/* destructor */
+    ~sem()
+    {
+        sem_destroy( &m_sem );
+    }
+	/*等待信号量*/
+    bool wait()
+    {
+        return sem_wait( &m_sem ) == 0;
+    }
+	/* 增加信号量 */
+    bool post()
+    {
+        return sem_post( &m_sem ) == 0;
+    }
+
+private:
+    sem_t m_sem;
+};
+
+/* 封装互斥锁的类 */
+class locker
+{
+public:
+	/* 创建并初始化互斥锁 */
+    locker()
+    {
+        if( pthread_mutex_init( &m_mutex, NULL ) != 0 )
+        {
+            throw std::exception();
+        }
+    }
+	/* destructor */
+    ~locker()
+    {
+        pthread_mutex_destroy( &m_mutex );
+    }
+	/* 加锁 */
+    bool lock()
+    {
+        return pthread_mutex_lock( &m_mutex ) == 0;
+    }
+	/* 解锁 */
+    bool unlock()
+    {
+        return pthread_mutex_unlock( &m_mutex ) == 0;
+    }
+
+private:
+    pthread_mutex_t m_mutex;
+};
+
+/* 封装条件变量 */
+class cond
+{
+public:
+	/* 创建并初始化条件变量 */
+    cond()
+    {
+        if( pthread_mutex_init( &m_mutex, NULL ) != 0 )
+        {
+            throw std::exception();
+        }
+        if ( pthread_cond_init( &m_cond, NULL ) != 0 )
+        {
+			/* 构造函数中一旦出现问题，就应该立即释放已经成功分配了的资源 */
+            pthread_mutex_destroy( &m_mutex );
+            throw std::exception();
+        }
+    }
+	/* destructor */
+    ~cond()
+    {
+        pthread_mutex_destroy( &m_mutex );
+        pthread_cond_destroy( &m_cond );
+    }
+	/* 等待条件变量 */
+    bool wait()
+    {
+        int ret = 0;
+        pthread_mutex_lock( &m_mutex );
+        ret = pthread_cond_wait( &m_cond, &m_mutex );
+        pthread_mutex_unlock( &m_mutex );
+        return ret == 0;
+    }
+	/* 唤醒等待的条件变量 */
+    bool signal()
+    {
+        return pthread_cond_signal( &m_cond ) == 0;
+    }
+
+private:
+    pthread_mutex_t m_mutex;
+    pthread_cond_t m_cond;
+};
+
+#endif
+```
+
+### 8. 多线程环境
+#### 8.1 可重入函数
+**==如果一个函数能被多个线程同时调用且不发生竞态条件，则我们称它是线程安全的（thread safe），或者说它是可重入函数。==**
+
+#### 8.2 线程和进程
+调用for之后，子
+进程只拥有一个执行线程，它是调用 fork 的那个线程的完整复制。并且子进程将自动继承父进程中互斥锁（条件变量与之类似）的状态。也就是说，父进程中已经被加锁的互斥锁在子进程中也是被锁住的。
+不过，pthread提供了一个专门的函数 pthread_atfork，以确保 fork 调用后父进程和子进
+程都拥有一个清楚的锁状态。该函数的定义如下∶
+```cpp
+#include <pthread.h>
+int pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void));
+```
+该函数将建立 3 个fork 句柄来帮助我们清理互斥锁的状态。prepare 句柄将在 fork 调用创建出子进程之前被执行。它可以用来锁住所有父进程中的互斥锁。parent 句柄则是 fork调用创建出子进程之后，而 fork返回之前，在父进程中被执行。它的作用是释放所有在prepare 句柄中被锁住的互斥锁。child 句柄是 fork 返回之前，在子进程中被执行。和 parent句柄一样，child 句柄也是用于释放所有在 prepare 句柄中被锁住的互斥锁。
+该函数成功时返回0，失败则返回错误码。
+
+<div align="center" style="font-weight:900;font-size:larger">使用_pthread_atfork函数</div>
+
+```cpp
+
+#include <pthread.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <wait.h>
+
+pthread_mutex_t mutex;
+
+void* another( void* arg )
+{
+    printf( "in child thread, lock the mutex\n" );
+    pthread_mutex_lock( &mutex );
+    sleep( 5 );
+    pthread_mutex_unlock( &mutex );
+}
+
+void prepare()
+{
+    pthread_mutex_lock( &mutex );
+}
+
+void infork()
+{
+    pthread_mutex_unlock( &mutex );
+}
+
+int main()
+{
+    pthread_mutex_init( &mutex, NULL );
+    pthread_t id;
+    pthread_create( &id, NULL, another, NULL );
+    pthread_atfork( prepare, infork, infork );
+    sleep( 1 );
+    int pid = fork();
+    if( pid < 0 )
+    {
+        pthread_join( id, NULL );
+        pthread_mutex_destroy( &mutex );
+        return 1;
+    }
+    else if( pid == 0 )
+    {
+        printf( "I anm in the child, want to get the lock\n" );
+        pthread_mutex_lock( &mutex );
+        printf( "I can not run to here, oop...\n" );
+        pthread_mutex_unlock( &mutex );
+        exit( 0 );
+    }
+    else
+    {
+        pthread_mutex_unlock( &mutex );
+        wait( NULL );
+    }
+    pthread_join( id, NULL );
+    pthread_mutex_destroy( &mutex );
+    return 0;
+}
+```
+
+#### 8.3 线程和信号
+每个线程都可以独立地设置信号掩码。
+在多线程环境下我们应该使用如下所示的 pthread版本的 sigprocmask 函数来设置线程信号掩码∶
+```cpp
+#include <pthread.h>
+#include <signal.h>
+int pthread_sigmask(int how, const sigset_t* newmask, sigset_t* oldmask);
+```
+由于进程中的所有线程共享该进程的信号，所以线程库将根据线程掩码决定把信号发送给哪个具体的线程。因此，如果我们在每个子线程中都单独设置信号掩码，就很容易导致逻辑错误。此外，所有线程共享信号处理函数。也就是说，当我们在一个线程中设置了某个信号的信号处理函数后，它将覆盖其他线程为同一个信号设置的信号处理函数。这两点都说明，我们应该定义一个专门的线程来处理所有的信号。这可以通过如下两个步骤来实现:
+1)在主线程创建出其他子线程之前就调用pthread_sigmask来设置好信号掩码，所有新创建的子线程都将自动继承这个信号掩码。这样做之后，实际上所有线程都不会响应被屏蔽的信号了。
+2)在某个线程中调用如下函数来等待信号并处理之:
+```cpp
+#include <signal.h>
+int sigwait(const sigset_t* set, int* sig);
+```
+set参数指定需要等待的信号的集合。我们可以简单地将其指定为在第1步中创建的信号掩码，表示在该线程中等待所有被屏蔽的信号。参数sig 指向的整数用于存储该函数返回的信号值。sigwait成功时返回0，失败则返回错误码。一旦sigwait正确返回，我们就可以对接收到的信号做处理了。很显然，如果我们使用了sigwait，就不应该再为信号设置信号处理函数了。这是因为当程序接收到信号时，二者中只能有一个起作用。
+
+<div align="center" style="font-size:larger;font-weight:900">用一个线程处理所有信号</div>
+```cpp
+
+       #include <pthread.h>
+       #include <stdio.h>
+       #include <stdlib.h>
+       #include <unistd.h>
+       #include <signal.h>
+       #include <errno.h>
+
+       /* Simple error handling functions */
+
+       #define handle_error_en(en, msg) \
+               do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
+
+       static void *
+       sig_thread(void *arg)
+       {
+	printf( "yyyyy, thread id is: %ld\n", pthread_self() );
+           sigset_t aset;
+           int s, sig;
+           sigemptyset(&aset);
+           sigaddset(&aset, SIGQUIT);
+           sigaddset(&aset, SIGUSR1);
+           //s = pthread_sigmask(SIG_BLOCK, &aset, NULL);
+           sigset_t *set = (sigset_t *) arg;
+
+           for (;;) {
+               s = sigwait(set, &sig);
+               if (s != 0)
+                   handle_error_en(s, "sigwait");
+               printf("Signal handling thread got signal %d\n", sig);
+           }
+       }
+
+static void handler( int arg )
+{
+	printf( "xxxxx, thread id is: %ld\n", pthread_self() );
+}
+
+       int
+       main(int argc, char *argv[])
+       {
+           pthread_t thread;
+           sigset_t set;
+           int s;
+
+           /* Block SIGINT; other threads created by main() will inherit
+ *               a copy of the signal mask. */
+
+           signal( SIGQUIT, handler );
+//           if (s != 0)
+  //             handle_error_en(s, "pthread_sigmask");
+
+           s = pthread_create(&thread, NULL, &sig_thread, (void *) &set);
+           sigemptyset(&set);
+           sigaddset(&set, SIGQUIT);
+           sigaddset(&set, SIGUSR1);
+           //s = pthread_sigmask(SIG_BLOCK, &set, NULL);
+           if (s != 0)
+               handle_error_en(s, "pthread_create");
+           printf( "sub thread with id: %ld\n", thread );
+           /* Main thread carries on to create other threads and/or do
+ *               other work */
+
+           pause();            /* Dummy pause so we can test program */
+       }
+
+```
+
+最后，pthread 还提供了下面的方法，使得我们可以明确地将一个信号发送给指定的线程∶
+```cpp
+#include <signal.h>
+int pthread_kil(pthread_t thread, int sig);
+```
+其中，thread参数指定目标线程，sig参数指定待发送的信号。如果 sig为 0，则 pthread_kill不发送信号，但它任然会执行错误检查。我们可以利用这种方式来检测目标线程是否存在。pthread_kill 成功时返回 0，失败则返回错误码。
+
+
+
+
+
+## 进程池和线程池
+#### 1. 进程池和线程池概述
+进程池中的所有子进程都运行着相同的代码，并具有相同的属性，比如优先级、PGID等。因为进程池在服务器启动之初就创建好了，所以每个子进程都相对“干净”，即它们没有打开不必要的文件描述符（从父进程继承而来)，也不会错误地使用大块的堆内存（从父进程复制得到)。
+当有新的任务到来时，主进程将通过某种方式选择进程池中的某一个子进程来为之服务。相比于动态创建子进程，选择一个已经存在的子进程的代价显然要小得多。至于主进程选择哪个子进程来为新任务服务，则有两种方式:
+- 主进程使用某种算法来主动选择子进程。最简单、最常用的算法是随机算法和 RoundRobin（轮流选取）算法，但更优秀、更智能的算法将使任务在各个工.作进程中更均匀地分配，从而减轻服务器的整体压力。
+- 主进程和所有子进程通过一个共享的工作队列来同步，子进程都睡眠在该工作队列上。当有新的任务到来时，主进程将任务添加到工作队列中。这将唤醒正在等待任务的子进程，不过只有一个子进程将获得新任务的“接管权”，它可以从工.作队列中取出任务并执行之，而其他子进程将继续睡眠在工作队列上。
+当选择好子进程后，主进程还需要使用某种通知机制来告诉目标子进程有新任务需要处理，并传递必要的数据。最简单的方法是，在父进程和子进程之间预先建立好一条管道，然后通过该管道来实现所有的进程间通信（当然，要预先定义好一套协议来规范管道的使用）。在父线程和子线程之间传递数据就要简单得多，因为我们可以把这些数据定义为全局的，那么它们本身就是被所有线程共享的。
+
+#### 2.处理多客户
+在使用进程池处理多客户任务时，首先要考虑的一个问题是; 监听 socket 和连接socket是否都由主进程来统一管理。
+
+
+#### 3.半同步/半异步进程池实现
+为了避免在父、子进程之间传递文件描述符，我们将接受新连接的操作放到子进程中。很显然，对于这种模式而言，一个客户连接上的所有任务始终是由一个子进程来处理的。
+```cpp
+
+#ifndef PROCESSPOOL_H
+#define PROCESSPOOL_H
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+
+/*描述一个子进程的类，m_pid是目标子进程的PID，m_pipefd是父进程和子进程通信用的管道 */
+class process
+{
+public:
+    process() : m_pid( -1 ){}
+
+public:
+    pid_t m_pid;
+    int m_pipefd[2];
+};
+
+/* 进程池类，将它定义为模板类是为了代码复用。其模板参数是处理逻辑任务的类 */
+template< typename T >
+class processpool
+{
+private:
+	/* 将构造函数定义为私有的，因此我们只能通过后面的create 静态函数来创建processpool实例*/
+    processpool( int listenfd, int process_number = 8 );
+public:
+	/*singleton模式，以保证程序最多创建一个processpool 实例，这是程序正确处理信号的必要条件 */
+    static processpool< T >* create( int listenfd, int process_number = 8 )
+    {
+        if( !m_instance )
+        {
+            m_instance = new processpool< T >( listenfd, process_number );
+        }
+        return m_instance;
+    }
+    ~processpool()
+    {
+        delete [] m_sub_process;
+    }
+    void run();
+
+private:
+    void setup_sig_pipe();
+    void run_parent();
+    void run_child();
+
+private:
+	/* 进程泡允许的最大子进程数量 */
+    static const int MAX_PROCESS_NUMBER = 16;
+	/* 每个子进程最多能处理的客户数量 */
+    static const int USER_PER_PROCESS = 65536;
+	/*epoll最多能处理的事件数*/
+    static const int MAX_EVENT_NUMBER = 10000;
+	/* 进程池中的进程总数*/
+    int m_process_number;
+	/* 子进程在池中的序号，从 0 开始*/
+    int m_idx;
+	/*每个进程都有一个epoll内核事件表，用m_epollfd标识 */
+    int m_epollfd;
+	/* 监听 socket*/
+    int m_listenfd;
+	/* 子进程通过m_stop 来决定是否停止运行 */
+    int m_stop;
+	/* 保存所有子进程的描述信息*/
+    process* m_sub_process;
+	/* 进程池静态实例 */
+    static processpool< T >* m_instance;
+};
+
+template< typename T >
+processpool< T >* processpool< T >::m_instance = NULL;
+
+/* 用于处理信号的管道，以实现统一事件源。后面称之为信号管道 */
+static int sig_pipefd[2];
+
+/* 设置文件描述符为非阻塞 */
+static int setnonblocking( int fd )
+{
+    int old_option = fcntl( fd, F_GETFL );
+    int new_option = old_option | O_NONBLOCK;
+    fcntl( fd, F_SETFL, new_option );
+    return old_option;
+}
+
+/* 往注册表中添加事件 */
+static void addfd( int epollfd, int fd )
+{
+    epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET;
+    epoll_ctl( epollfd, EPOLL_CTL_ADD, fd, &event );
+    setnonblocking( fd );
+}
+
+/* 从注册表中删除事件 */
+static void removefd( int epollfd, int fd )
+{
+    epoll_ctl( epollfd, EPOLL_CTL_DEL, fd, 0 );
+    close( fd );
+}
+
+/* 信号处理函数 */
+static void sig_handler( int sig )
+{
+    int save_errno = errno;
+    int msg = sig;
+    send( sig_pipefd[1], ( char* )&msg, 1, 0 );
+    errno = save_errno;
+}
+
+/* 添加信号 */
+static void addsig( int sig, void( handler )(int), bool restart = true )
+{
+    struct sigaction sa;
+    memset( &sa, '\0', sizeof( sa ) );
+    sa.sa_handler = handler;
+    if( restart )
+    {
+        sa.sa_flags |= SA_RESTART;
+    }
+    sigfillset( &sa.sa_mask );
+    assert( sigaction( sig, &sa, NULL ) != -1 );
+}
+
+/* 进程池构造函数。参数listenfd是监听 socket，它必须在创建进程池之前被创建，否则子进程无法直接引用它。参数 process_number 指定进程泡中子进程的数量*/
+template< typename T >
+processpool< T >::processpool( int listenfd, int process_number ) 
+    : m_listenfd( listenfd ), m_process_number( process_number ), m_idx( -1 ), m_stop( false )
+{
+    assert( ( process_number > 0 ) && ( process_number <= MAX_PROCESS_NUMBER ) );
+
+    m_sub_process = new process[ process_number ];
+    assert( m_sub_process );
+
+	/* 创建 process_number 个子进程，并建立它们和父进程之间的管道 */
+    for( int i = 0; i < process_number; ++i )
+    {
+        int ret = socketpair( PF_UNIX, SOCK_STREAM, 0, m_sub_process[i].m_pipefd );
+        assert( ret == 0 );
+
+        m_sub_process[i].m_pid = fork();
+        assert( m_sub_process[i].m_pid >= 0 );
+        if( m_sub_process[i].m_pid > 0 )
+        {
+            close( m_sub_process[i].m_pipefd[1] );
+            continue;
+        }
+        else
+        {
+            close( m_sub_process[i].m_pipefd[0] );
+            m_idx = i;
+            break;
+        }
+    }
+}
+
+/* 统一事件源 */
+template< typename T >
+void processpool< T >::setup_sig_pipe()
+{
+	/* 创建epol1事件监听表和信号管道*/
+    m_epollfd = epoll_create( 5 );
+    assert( m_epollfd != -1 );
+
+    int ret = socketpair( PF_UNIX, SOCK_STREAM, 0, sig_pipefd );
+    assert( ret != -1 );
+
+    setnonblocking( sig_pipefd[1] );
+    addfd( m_epollfd, sig_pipefd[0] );
+
+    addsig( SIGCHLD, sig_handler );
+    addsig( SIGTERM, sig_handler );
+    addsig( SIGINT, sig_handler );
+    addsig( SIGPIPE, SIG_IGN );
+}
+
+/* 父进程中m_idx值为-1，子进程中m_idx值大于等于 0，我们据此判断接下来要运行的是父进程代码 还是子进程代码*/
+template< typename T >
+void processpool< T >::run()
+{
+    if( m_idx != -1 )
+    {
+        run_child();
+        return;
+    }
+    run_parent();
+}
+
+template< typename T >
+void processpool< T >::run_child()
+{
+    setup_sig_pipe();
+
+	/* 每个子进程都通过其在进程池中的序号值m_idx 找到与父进程通信的管道*/
+    int pipefd = m_sub_process[m_idx].m_pipefd[ 1 ];
+	/* 子进程需要监听管道文件描述符pipefd，因为父进程将通过它来通知子进程 accept新连接*/
+    addfd( m_epollfd, pipefd );
+
+    epoll_event events[ MAX_EVENT_NUMBER ];
+    T* users = new T [ USER_PER_PROCESS ];
+    assert( users );
+    int number = 0;
+    int ret = -1;
+
+    while( ! m_stop )
+    {
+        number = epoll_wait( m_epollfd, events, MAX_EVENT_NUMBER, -1 );
+        if ( ( number < 0 ) && ( errno != EINTR ) )
+        {
+            printf( "epoll failure\n" );
+            break;
+        }
+
+        for ( int i = 0; i < number; i++ )
+        {
+            int sockfd = events[i].data.fd;
+            if( ( sockfd == pipefd ) && ( events[i].events & EPOLLIN ) )
+            {
+                int client = 0;
+				/* 从父、子进程之间的管道读取数据，并将结果保存在变量 client 中。如果读取成功，则表示有新客户连接到来 */
+                ret = recv( sockfd, ( char* )&client, sizeof( client ), 0 );
+                if( ( ( ret < 0 ) && ( errno != EAGAIN ) ) || ret == 0 ) 
+                {
+                    continue;
+                }
+                else
+                {
+                    struct sockaddr_in client_address;
+                    socklen_t client_addrlength = sizeof( client_address );
+                    int connfd = accept( m_listenfd, ( struct sockaddr* )&client_address, &client_addrlength );
+                    if ( connfd < 0 )
+                    {
+                        printf( "errno is: %d\n", errno );
+                        continue;
+                    }
+                    addfd( m_epollfd, connfd );
+					/* 模板类下必须实现init方法，以初始化一个客户连接。我们直接使用connfd 来索引逻辑处理对象（T 类型的对象），以提高程序效率*/
+                    users[connfd].init( m_epollfd, connfd, client_address );
+                }
+            }
+			/* 下面处理子进程接收到的信号*/
+            else if( ( sockfd == sig_pipefd[0] ) && ( events[i].events & EPOLLIN ) )
+            {
+                int sig;
+                char signals[1024];
+                ret = recv( sig_pipefd[0], signals, sizeof( signals ), 0 );
+                if( ret <= 0 )
+                {
+                    continue;
+                }
+                else
+                {
+                    for( int i = 0; i < ret; ++i )
+                    {
+                        switch( signals[i] )
+                        {
+                            case SIGCHLD:
+                            {
+                                pid_t pid;
+                                int stat;
+                                while ( ( pid = waitpid( -1, &stat, WNOHANG ) ) > 0 )
+                                {
+                                    continue;
+                                }
+                                break;
+                            }
+                            case SIGTERM:
+                            case SIGINT:
+                            {
+                                m_stop = true;
+                                break;
+                            }
+                            default:
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+			/* 如果是其他可读数据，那么必然是客户请求到来。调用逻辑处理对象的process 方法处理之*/
+            else if( events[i].events & EPOLLIN )
+            {
+                 users[sockfd].process();
+            }
+            else
+            {
+                continue;
+            }
+        }
+    }
+
+    delete [] users;
+    users = NULL;
+    close( pipefd );
+    //close( m_listenfd );
+    close( m_epollfd );
+}
+
+template< typename T >
+void processpool< T >::run_parent()
+{
+    setup_sig_pipe();
+
+	/* 父进程监听m_listenfd */
+    addfd( m_epollfd, m_listenfd );
+
+    epoll_event events[ MAX_EVENT_NUMBER ];
+    int sub_process_counter = 0;
+    int new_conn = 1;
+    int number = 0;
+    int ret = -1;
+
+    while( ! m_stop )
+    {
+        number = epoll_wait( m_epollfd, events, MAX_EVENT_NUMBER, -1 );
+        if ( ( number < 0 ) && ( errno != EINTR ) )
+        {
+            printf( "epoll failure\n" );
+            break;
+        }
+
+        for ( int i = 0; i < number; i++ )
+        {
+            int sockfd = events[i].data.fd;
+            if( sockfd == m_listenfd )
+            {
+				/*如果有新连接到来，就采用 Round Robin方式将其分配给一个子进程处理 */
+                int i =  sub_process_counter;
+                do
+                {
+                    if( m_sub_process[i].m_pid != -1 )
+                    {
+                        break;
+                    }
+                    i = (i+1)%m_process_number;
+                }
+                while( i != sub_process_counter );
+                
+                if( m_sub_process[i].m_pid == -1 )
+                {
+                    m_stop = true;
+                    break;
+                }
+                sub_process_counter = (i+1)%m_process_number;
+                //send( m_sub_process[sub_process_counter++].m_pipefd[0], ( char* )&new_conn, sizeof( new_conn ), 0 );
+                send( m_sub_process[i].m_pipefd[0], ( char* )&new_conn, sizeof( new_conn ), 0 );
+                printf( "send request to child %d\n", i );
+                //sub_process_counter %= m_process_number;
+            }
+			/* 下面处理父进程接收到的信号*/
+            else if( ( sockfd == sig_pipefd[0] ) && ( events[i].events & EPOLLIN ) )
+            {
+                int sig;
+                char signals[1024];
+                ret = recv( sig_pipefd[0], signals, sizeof( signals ), 0 );
+                if( ret <= 0 )
+                {
+                    continue;
+                }
+                else
+                {
+                    for( int i = 0; i < ret; ++i )
+                    {
+                        switch( signals[i] )
+                        {
+                            case SIGCHLD:
+                            {
+                                pid_t pid;
+                                int stat;
+                                while ( ( pid = waitpid( -1, &stat, WNOHANG ) ) > 0 )
+                                {
+                                    for( int i = 0; i < m_process_number; ++i )
+                                    {
+										/* 如果进程泡中第i个子进程退出了，则主进程关闭相应的通信管道，并设置相应的m_pid为-1，以标记该子进程已经退出*/
+                                        if( m_sub_process[i].m_pid == pid )
+                                        {
+                                            printf( "child %d join\n", i );
+                                            close( m_sub_process[i].m_pipefd[0] );
+                                            m_sub_process[i].m_pid = -1;
+                                        }
+                                    }
+                                }
+								/* 如果所有子进程都已经退出了，则父进程也退出 */
+                                m_stop = true;
+                                for( int i = 0; i < m_process_number; ++i )
+                                {
+                                    if( m_sub_process[i].m_pid != -1 )
+                                    {
+                                        m_stop = false;
+                                    }
+                                }
+                                break;
+                            }
+                            case SIGTERM:
+                            case SIGINT:
+                            {
+                                printf( "kill all the clild now\n" );
+                                for( int i = 0; i < m_process_number; ++i )
+                                {
+                                    int pid = m_sub_process[i].m_pid;
+                                    if( pid != -1 )
+                                    {
+                                        kill( pid, SIGTERM );
+                                    }
+                                }
+                                break;
+                            }
+                            default:
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                continue;
+            }
+        }
+    }
+
+    //close( m_listenfd );
+    close( m_epollfd );
+}
+
+#endif
+```
+
+
+
+
+
+
+
+
+
 
